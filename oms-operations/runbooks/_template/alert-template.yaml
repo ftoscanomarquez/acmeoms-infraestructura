@@ -1,0 +1,41 @@
+# Plantilla de alerta Prometheus para acompañar un runbook.
+# Reglas críticas del oficio:
+#   1. `runbook_url` SIEMPRE con variables del incidente pre-rellenadas
+#   2. `for:` para evitar alertas por picos transitorios
+#   3. `severity` consistente con la política del equipo
+#   4. `summary` corto (cabe en notificación móvil), `description` con contexto
+
+groups:
+  - name: TODO_modulo                 # ej: orders, payments, infra
+    interval: 30s
+    rules:
+
+      - alert: TODO_NombreAlertaEnCamelCase
+        expr: |
+          # TODO PromQL: define el SLI o la condición de incidente
+          # Tip: si es un SLO de latencia, usa histogram_quantile
+          # Tip: si es burn rate, mira la regla de Alertmanager del Vídeo 2
+          TODO_PROMQL_AQUI
+        for: TODO_DURACION                # ej: 5m, 10m — evita disparos por picos
+        labels:
+          severity: TODO                  # critical | warning | info
+          team: TODO                      # ej: orders-team
+          service: TODO                   # ej: oms-orders-api
+        annotations:
+          summary: "TODO frase corta con {{ $labels.instance }} si aplica"
+          description: |
+            TODO descripción de 2-3 líneas con contexto.
+            Incluye: qué está pasando, en qué instancia, valor actual vs umbral.
+            Ej: "Pool de conexiones al {{ $value | humanizePercentage }} durante >3m
+                 en la instancia {{ $labels.instance }}. Si llega al 100%,
+                 las nuevas conexiones empezarán a fallar."
+          runbook_url: "https://runbooks.example.com/TODO-runbook-slug?instance={{ $labels.instance }}&value={{ $value }}"
+          dashboard_url: "https://grafana.example.com/d/TODO-uid"
+
+# ─── Notas para el alumno ─────────────────────────────────────────
+#
+# Las variables {{ $labels.X }} y {{ $value }} las rellena Alertmanager
+# con los datos del incidente concreto en el momento de disparar.
+# Cuando el on-call abre PagerDuty y hace clic en runbook_url, el runbook
+# se abre con el contexto YA cargado. Esa es la diferencia entre un buen
+# runbook y uno que se busca en un wiki.
