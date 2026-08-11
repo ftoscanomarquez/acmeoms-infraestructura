@@ -1,3 +1,10 @@
+# ⚠️⚠️⚠️  ¡ATENCIÓN — LEE ESTO ANTES DE EMPEZAR!  ⚠️⚠️⚠️
+# 👉 EL DOMINIO DE TU ENTREGA ES: **OMS (AcmeOMS)** 👈
+# ❌ ¡NO entregues otro sistema! Cualquier otro dominio que aparezca aquí es SOLO ejemplo de referencia del equipo docente.
+# ℹ️ Cada bloque ALTERNA el dominio a propósito: es parte del aprendizaje, aplicar los conceptos a un dominio distinto (como en el trabajo real).
+
+---
+
 # Trabajo final — Bloque 4 · Plataforma e infraestructura
 
 ## 1 · Contexto
