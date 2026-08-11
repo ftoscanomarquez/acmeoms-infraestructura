@@ -1,180 +1,233 @@
-# Trabajo final — Bloque 5 · Operación y observabilidad
+# Trabajo final — Bloque 4 · Plataforma e infraestructura
 
 ## 1 · Contexto
 
-En el Bloque 4 construiste la plataforma del OMS sobre GCP: VPC, Cloud SQL, Memorystore, Cloud Run, Load Balancer, CI/CD con WIF. **La plataforma corre**.
+Eres parte del equipo de plataforma de **AcmeOMS**, un SaaS que gestiona pedidos para tiendas online. El documento de arquitectura del sistema (lo tienes en el material del curso, `03-arquitectura.md`) describe el OMS como un **monolito modular** desplegado en dos regiones, con seis bounded contexts (Catalog, Inventory, Orders, Payments, Billing, IAM), persistencia en PostgreSQL multi-AZ, caché en Redis, y pagos delegados a Stripe.
 
-Lo que **no tienes** es ningún manual de operaciones, ni un SLO formal, ni una sola alerta configurada, ni un solo runbook escrito. Si algo se rompe en producción ahora mismo, el on-call empieza a improvisar a las 3 AM con un café y mucha esperanza.
+**Tu trabajo en este bloque NO es implementar la aplicación** —eso vendrá en bloques posteriores—. **Tu trabajo es provisionar y operar la infraestructura** que la va a alojar. Para esto vas a usar todo lo que aprendiste en los cinco vídeos: Docker, Cloud (GCP), Terraform, CI/CD avanzado y Ansible.
 
-Tu trabajo en el Bloque 5 es **cerrar ese gap**: entregar el conjunto de documentos operativos que convierten una plataforma "viva" en una plataforma "gobernable".
+### Una decisión que tomamos por ti: GCP en lugar de AWS
 
-> 💡 Una observación honesta sobre este trabajo
-> El entregable son **documentos**: runbooks, políticas, planes, mocks de YAML. Suena menos sexy que el Bloque 4 (donde escribías Terraform real). Pero en operación, el oficio se materializa en documentos. Un runbook bien escrito a las 3 AM vale más que mil dashboards bonitos. Este trabajo es el que separa a un equipo de ops maduro de uno que aguanta como puede.
+El documento de arquitectura original menciona AWS (RDS, ElastiCache, ECS/EKS, CloudFront). Para mantener coherencia con el bloque, **vas a implementar la versión equivalente en Google Cloud Platform**. El mapeo de servicios queda así:
+
+| Concepto | Equivalente AWS (doc original) | Equivalente GCP (tu trabajo) |
+|---|---|---|
+| Base de datos relacional managed | RDS PostgreSQL | Cloud SQL PostgreSQL |
+| Caché en memoria | ElastiCache Redis | Memorystore Redis |
+| Contenedores managed | ECS / EKS | Cloud Run (o GKE Autopilot opcional) |
+| Object storage / SPA | S3 + CloudFront | Cloud Storage + Cloud CDN |
+| Secretos | Secrets Manager | Secret Manager |
+| IAM federada para CI/CD | OIDC + IAM Role | Workload Identity Federation |
+
+La arquitectura lógica y las restricciones (NFRs, OPS, REG) **NO cambian**. Solo cambia la implementación.
 
 ---
 
 ## 2 · Objetivo
 
-Producir un repositorio Git con la documentación operativa completa del OMS:
+Construir, con **Terraform** y **Ansible**, un subconjunto operativo de la plataforma del OMS sobre Google Cloud que cumpla la spec original y que pueda desplegarse en dos entornos —staging y producción— con el mismo binario.
 
-- **3 runbooks completos** (1 obligatorio + 2 a elegir del catálogo)
-- Cada runbook con su **alerta PromQL**, **contexto operativo** y **evolución a lo largo de 3 post-mortems**
-- **2 SLOs formales** con sus SLIs derivados de la spec
-- **1 política de error budget** de una página
-- **1 GameDay plan** que valida uno de tus runbooks
-- **1 documento de instrumentación** que dice qué se monitoriza en cada módulo del OMS y por qué
+### Arquitectura objetivo (subset realista)
 
-Todo el trabajo aplica sobre la arquitectura del OMS (la del `03-arquitectura.md`). Donde necesites comandos concretos, puedes usar la demo `codecrypto-ai` del handoff como referencia.
+```
+                    ┌─────────────────────┐
+                    │   USUARIOS FINALES  │
+                    └──────────┬──────────┘
+                               │ HTTPS (TLS 1.3)
+                               ▼
+                    ┌─────────────────────┐
+                    │ HTTPS Load Balancer │  ← Cloud LB + Cloud CDN
+                    │      + WAF          │
+                    └──────────┬──────────┘
+                               │
+                  ┌────────────┼─────────────┐
+                  │            │             │
+                  ▼            ▼             ▼
+              ┌──────────────────────────────────┐
+              │  Cloud Run — OMS app             │  ← stateless, autoescalado
+              │  (contenedor del monolito)       │     (NFR-SCAL-001)
+              └────────┬─────────────────┬───────┘
+                       │                 │
+                       ▼                 ▼
+              ┌─────────────┐  ┌──────────────────┐
+              │ Memorystore │  │   Cloud SQL      │  ← multi-zone HA
+              │   Redis     │  │   PostgreSQL     │     (NFR-AVAIL-001)
+              │  (caché)    │  │                  │     (OPS-005 backups)
+              └─────────────┘  └──────────────────┘
+                                        │
+                                        ▼
+                              ┌──────────────────┐
+                              │ Cloud Storage    │  ← static SPA + backups
+                              │ (SPA + assets)   │
+                              └──────────────────┘
+
+                  Todo dentro de una VPC privada
+                  región: europe-west3 (Frankfurt) — REG-GDPR-001
+                  secretos: Secret Manager
+                  CI/CD: GitHub Actions con Workload Identity Federation
+```
 
 ---
 
 ## 3 · Restricciones de la spec que tienes que cumplir
 
-### Heredadas del Bloque 4 (releídas con ojos de operación)
-- **REG-GDPR-001** — Datos solo en regiones europeas
-- **NFR-AVAIL-001** — Multi-AZ con failover automático (los SLOs deben reflejar esto)
-- **NFR-PERF-002** — p95 < 250 ms en endpoints críticos
-- **NFR-PERF-003** — p99 < 800 ms
-- **OPS-005** — Backups con PITR 14d, RTO ≤ 4h
-- **OPS-007** — Degradación elegante: si una pieza cae, el sistema sigue respondiendo
+Las que están escritas en `01-inventario-restricciones.md` del proyecto original. Para tu trabajo, son **innegociables**:
 
-### Del oficio que aprendiste en este bloque
+### Cumplimiento regulatorio
+- **REG-GDPR-001** — Despliegue solo en regiones europeas (`europe-west3` obligatoria; `europe-central2` opcional para el bonus DR)
+- **REG-GDPR-003** — Audit trail inmutable: Cloud Logging con sink a un bucket de retención larga
+- **REG-PCI-001** — Cero datos de tarjeta tocando tu infra (Stripe queda fuera de scope)
 
-| # | Regla | Vídeo |
-|---|---|---|
-| 1 | Cada runbook tiene trigger · contexto · diagnóstico copiable · acciones idempotentes · verificación medible · rollback | V3 |
-| 2 | Cero "reinicia el servicio" como única acción | V3 |
-| 3 | Los post-mortems muestran evolución (V1 manual → V2 con comandos → V3 automatizada) | V3 + V5 |
-| 4 | Los SLOs miden lo que importa al **usuario**, no lo que es fácil de medir | V2 |
-| 5 | Toda alerta tiene `runbook_url` con variables del incidente pre-rellenadas | V1 + V3 |
-| 6 | La política de error budget tiene umbrales **numéricos** y consecuencias **explícitas** | V2 |
-| 7 | Cuando una acción de mitigación se puede expresar como feature flag, **se expresa** | V4 |
+### No funcionales
+- **NFR-AVAIL-001** — Multi-zone con failover automático (Cloud SQL con `availability_type = "REGIONAL"`)
+- **NFR-SEC-001** — Encriptación en reposo (CMEK opcional para bonus; AES-256 por defecto obligatorio)
+- **NFR-SEC-002** — TLS 1.3 en el Load Balancer
+- **NFR-SCAL-001** — Autoescalado horizontal hasta 5× el pico medido (`max_instance_count` en Cloud Run)
+- **NFR-PERF-001** — Caché Redis delante del catálogo
+
+### Operativas
+- **OPS-005** — Backups con Point-In-Time Recovery 14 días; un ejercicio de restauración mensual en staging (no implementas el ejercicio, solo dejas el comando documentado en runbook)
+- **OPS-007** — Sistema degrada suavemente: si Redis cae, la app sigue respondiendo desde la DB
+
+### Operativas que aprendiste en el bloque
+- **Cero credenciales estáticas** en el repo o en variables de CI (Vídeo 4)
+- **Mismo `image_sha`** en staging y producción (Vídeo 5)
+- **Idempotencia** en todos los playbooks (Vídeo 5)
+- **`terraform plan` limpio** antes de cualquier `apply` (Vídeo 3)
+- **`deletion_protection = true`** + `lifecycle { prevent_destroy = true }` en la base de datos (Vídeo 3)
 
 ---
 
 ## 4 · Entregables
 
+Entregas un repo Git con la estructura que viene en este esqueleto. Cada `TODO` que encuentres es tuyo de rellenar.
+
 ```
-oms-operations/
-├── README.md                              ← cómo arrancar
+oms-platform/
+├── README.md                              ← descripción y cómo arrancar
 ├── Trabajo - enunciado.md                 ← este documento (no se modifica)
 ├── .gitignore
 │
-├── runbooks/
-│   ├── README.md                          ← índice + criterios comunes
-│   ├── _template/
-│   │   ├── runbook-template.md            ← copia y rellena para cada uno
-│   │   ├── alert-template.yaml
-│   │   └── post-mortems-template.md
-│   │
-│   ├── 01-db-pool-saturated/              ← OBLIGATORIO (todos)
-│   │   ├── runbook.md
-│   │   ├── alert.yaml
-│   │   └── post-mortems.md
-│   │
-│   ├── 02-CHOOSE/                          ← elige 1 del catálogo abajo
-│   └── 03-CHOOSE/                          ← elige otro distinto
+├── docker/
+│   └── Dockerfile                         ← multi-stage; cumple la spec del Vídeo 1
 │
-├── slos/
-│   ├── README.md
-│   ├── slos-orders.md                      ← 1 SLO del módulo orders
-│   ├── slos-payments.md                    ← 1 SLO del módulo payments
-│   └── error-budget-policy.md              ← política 1 página
+├── terraform/
+│   ├── versions.tf                        ← lock de providers
+│   ├── variables.tf                       ← variables del módulo raíz
+│   ├── main.tf                            ← composición de los 4 módulos
+│   ├── outputs.tf                         ← outputs útiles (LB IP, DB connection)
+│   ├── envs/
+│   │   ├── staging.tfvars                 ← valores para staging
+│   │   └── production.tfvars              ← valores para producción
+│   └── modules/
+│       ├── network/main.tf                ← VPC, subredes, firewall
+│       ├── database/main.tf               ← Cloud SQL + Memorystore Redis
+│       ├── compute/main.tf                ← Cloud Run + Load Balancer + CDN
+│       └── iam/main.tf                    ← Service Accounts + WIF
 │
-├── observability/
-│   ├── README.md
-│   └── instrumentation.md                  ← qué se instrumenta en cada módulo y por qué
+├── ansible/
+│   ├── ansible.cfg
+│   ├── requirements.yml                   ← colecciones: google.cloud
+│   ├── inventory/gcp.yml                  ← inventario dinámico (bonus bastion)
+│   ├── group_vars/
+│   │   ├── all.yml                        ← lo común a todos los entornos
+│   │   ├── staging.yml                    ← diferencias legítimas (capacidad, endpoints)
+│   │   └── production.yml                 ← idem
+│   ├── playbooks/
+│   │   ├── deploy.yml                     ← despliega `image_sha` al entorno
+│   │   └── rollback.yml                   ← rollback a la revisión anterior
+│   └── roles/oms_cloud_run/
+│       └── tasks/main.yml                 ← lógica idempotente del despliegue
 │
-├── gameday/
-│   ├── README.md
-│   └── gameday-plan.md                     ← diseñado para validar UNO de tus runbooks
-│
-└── ethics/                                 ← OPCIONAL (bonus)
-    └── ethical-risk-assessment.md
+└── .github/workflows/
+    └── ci-cd.yml                          ← matriz + build + WIF + promote
 ```
 
-### Catálogo de runbooks (elige 2 además del obligatorio)
+### Lo que tiene que pasar para que se considere terminado
 
-| ID | Nombre | Dificultad | Aplica lo de |
-|---|---|---|---|
-| 01 | db-pool-saturated | Media | V1+V2+V3 — **OBLIGATORIO** |
-| 02 | api-p95-high | Media | V1+V2+V3 |
-| 03 | stripe-payment-gateway-degraded | Alta | V3+V4 (circuit breaker como mitigación) |
-| 04 | outbox-backlog-creciente | Alta | V1+V3 (degradación silenciosa) |
-| 05 | redis-cache-down | Media | V3 (degradación elegante) |
-| 06 | cloud-sql-disk-full | Baja | V3 (prevención > reacción) |
-| 07 | canary-rollout-failed | Media | V3+V4 (auto-rollback) |
+| Comando | Qué debe pasar |
+|---|---|
+| `terraform init && terraform plan -var-file=envs/staging.tfvars` | Plan limpio, sin errores |
+| `terraform apply -var-file=envs/staging.tfvars` | Crea toda la infra de staging en GCP |
+| `terraform plan -var-file=envs/staging.tfvars` (segunda vez) | "No changes" — confirmación de que es idempotente |
+| `ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:...` | Despliega esa imagen a Cloud Run staging |
+| Repetir el playbook | `changed=0` — idempotencia |
+| `ansible-playbook playbooks/deploy.yml -e env=production -e image_sha=sha256:...` | Misma imagen va a producción |
+| Push a `main` con tag `v1.0.0` | El workflow construye, prueba, firma y despliega vía WIF |
 
 ---
 
 ## 5 · Rúbrica de evaluación (100 puntos)
 
-| Bloque | Pts | Cómo se evalúa |
+| Bloque | Pts | Criterio |
 |---|---|---|
-| **3 Runbooks completos** (15 pts × 3) | 45 | Estructura completa: trigger · contexto · diagnóstico copiable · acciones idempotentes ordenadas · verificación medible · rollback. Vale el `_template`. |
-| **Alertas PromQL** | 10 | Reglas con `for:`, `severity`, annotations con `runbook_url` enlazada y variables del incidente pre-rellenadas. |
-| **Post-mortems con evolución** | 10 | Cada runbook muestra V1 manual → V2 con comandos → V3 automatizada. Aprendizaje explícito por versión. |
-| **SLOs y SLIs** | 10 | 2 SLOs definidos con SLI exacto (numerador / denominador / ventana), justificación basada en experiencia del usuario. |
-| **Política de error budget** | 5 | Una página, niveles 🟢🟡🔴 con umbrales numéricos, política de freeze explícita. |
-| **GameDay plan** | 10 | Hipótesis · escenario · alcance acotado · métricas a observar · escape hatch · roles. Conecta con uno de tus runbooks. |
-| **Documento de instrumentación** | 5 | Tabla `quality attribute → métrica → SLI → alerta` para cada módulo del OMS. |
-| **README + decisiones** | 5 | Sección "decisiones" con los 3 trade-offs principales que tomaste durante el trabajo. |
+| **Estructura Terraform** | 15 | Módulos bien delimitados; variables tipadas con descripción; outputs útiles; `versions.tf` con providers fijados a versión menor. |
+| **Implementación recursos GCP** | 25 | VPC con subredes en al menos 2 zonas; Cloud SQL `REGIONAL` con PITR; Memorystore Redis Standard; Cloud Run con autoscaling; Load Balancer con CDN; Secret Manager con bindings. |
+| **Plan limpio + idempotencia** | 10 | `terraform plan` no muestra cambios en segunda ejecución; sin warnings. |
+| **Protecciones de producción** | 10 | `deletion_protection`, `prevent_destroy`, `backup_configuration` con PITR ≥ 14d, `database_version` pinneada. |
+| **Ansible deploy idempotente** | 15 | Playbook devuelve `changed=0` en segunda ejecución; usa módulos `google.cloud.gcp_cloudrun_*` (no shell directo); maneja la revisión y el switch de tráfico. |
+| **Diferencias staging/prod** | 10 | `diff group_vars/staging.yml group_vars/production.yml` muestra solo capacidad/endpoints — nada de comportamiento. Defendible con una línea por diferencia. |
+| **CI/CD con WIF (sin claves)** | 10 | Workflow con `permissions: id-token: write`, sin `GCP_SA_KEY_JSON` en `secrets`. Trust policy con `attribute.repository` constraint. |
+| **README + decisiones** | 5 | README claro con cómo arrancar; sección "Decisiones" explicando los 3 trade-offs principales que tomaste. |
 
-### Penalizaciones (acumulativas)
-- −20 pts — si algún runbook tiene "reinicia el servicio" como única acción
-- −10 pts — si un SLO mide salud de la infra en lugar de experiencia del usuario
-- −10 pts — si las alertas no tienen `runbook_url` enlazado
-- −5 pts — si la política de error budget no tiene umbrales numéricos
+**Penalizaciones:**
+- −20 pts si hay alguna credencial estática en el repo (las pillamos con `gitleaks`)
+- −10 pts si la imagen desplegada en `production` NO es el mismo SHA que la de `staging`
+- −5 pts por cada `terraform apply` que rompa producción en el entorno de evaluación
 
 ---
 
-## 6 · Bonus opcionales
+## 6 · Bonus opcionales (sumas sobre la nota)
 
 | Bonus | Pts | Qué implica |
 |---|---|---|
-| Ethical risk assessment | +10 | Para el "asistente IA de soporte al cliente" del OMS (sistema ficticio, ver `ethics/`), evaluación completa con 5 riesgos y controles |
-| Implementación automatizada de 1 runbook | +15 | Script (bash o Python) idempotente con `--dry-run` que ejecuta uno de tus runbooks |
-| Dashboard Grafana en JSON | +10 | Dashboard funcional con los paneles que apoyan tus runbooks y SLOs |
-| 4º o 5º runbook adicional | +5 c/u | Cada runbook completo más allá de los 3 obligatorios, hasta 2 |
+| Multi-region DR | +10 | Replica de Cloud SQL en `europe-central2` + runbook documentado de failover |
+| Cloud CDN con políticas finas | +5 | Cache TTLs derivados de los headers de la app; negative caching; signed URLs para SPA |
+| Bastion VM con Ansible | +10 | Una Compute Engine con `Datadog` agent vía role Ansible; inventario dinámico la descubre por label `role=bastion` |
+| CMEK propia | +5 | Clave KMS gestionada por ti en lugar de la default de Google, aplicada a Cloud SQL y a un bucket |
+| Migración expand-and-contract | +5 | Documentas (no implementas) el flujo para hacer un cambio destructivo de schema sin downtime |
 
 ---
 
 ## 7 · Referencias del bloque
 
-| Tarea | Vídeo |
-|---|---|
-| Diseñar alertas con burn rate y `runbook_url` | V1 + V2 |
-| Definir SLOs/SLIs y política de error budget | V2 |
-| Escribir un runbook efectivo (estructura, comandos, verificación) | V3 |
-| Comunicar el post-mortem a stakeholders no técnicos | V3 |
-| Acción de mitigación como feature flag o circuit breaker | V4 |
-| Diseñar el GameDay plan | V5 |
-| Ethical risk assessment | V5 (cierre) |
+Cada parte del trabajo se apoya en un vídeo concreto. Si te bloqueas, vuelve aquí.
 
-Y los temarios + guion del bloque:
-- `Temario detallado – Módulo 2 · Operación, observabilidad y profesión.md`
-- `Guion completo – Bloque 5 · Operación y observabilidad.md`
+| Tarea | Vídeo que te ayuda |
+|---|---|
+| Escribir el Dockerfile del OMS | **Vídeo 1** — multi-stage, no-root, healthcheck, labels OCI |
+| Decidir entre Cloud Run y GKE | **Vídeo 2** — managed vs self-managed, modelo de coste |
+| Estructurar Terraform en módulos | **Vídeo 3** — modules, envs, plan-apply, defensas de producción |
+| Configurar WIF en GitHub Actions | **Vídeo 4** — Workload Identity Federation, secretos efímeros |
+| Diferenciar entornos sin reconstruir | **Vídeo 5** — group_vars, mismo SHA, idempotencia |
+
+Y los temarios detallados con código de ejemplo:
+
+- `Temario detallado – Bloque 4 · Plataforma e infraestructura.md`
+- `Guion completo – Bloque 4 · Plataforma e infraestructura.md`
 
 ---
 
 ## 8 · Política de uso de IA
 
-**Permitido y recomendado:** usar Claude, Copilot, Gemini o cualquier otro asistente para generar borradores.
+**Permitido y recomendado:** usar Claude, Copilot, Gemini o cualquier otro asistente para generar borradores de Terraform y Ansible.
 
-**Obligatorio:** documentar en el README, en la sección "Decisiones", los **3 cambios concretos** que hiciste al borrador de la IA antes de aprobar el documento. Igual que vimos en el Vídeo 3 del Bloque 4 con el ejemplo de Cloud SQL.
+**Obligatorio:** documentar en el README, en la sección "Decisiones", los **3 cambios concretos** que hiciste al borrador de la IA antes de aprobar el código. Igual que vimos en el Vídeo 3 con el ejemplo de Cloud SQL.
 
-Si tu runbook viene de un prompt y no lo has revisado críticamente, se nota en la primera lectura. Y a las 3 AM, en producción, **el runbook que generó la IA y nadie revisó es peor que no tener runbook**.
+Trabajar con IA está bien. Aplicar lo que sale sin revisar, no.
 
 ---
 
 ## 9 · Cómo entregar
 
-1. Clona este esqueleto en un repo privado
-2. Completa los `TODO` (búscalos con `grep -r TODO`)
-3. Para cada runbook, **léelo en voz alta como si fueras el on-call a las 3 AM**: ¿podrías seguirlo sin pararte a pensar? Si no, falta detalle.
+1. Clona este esqueleto en un repo privado tuyo (GitHub, GitLab, lo que prefieras)
+2. Completa todos los `TODO` (busca `TODO:` en todos los ficheros con `grep -r TODO`)
+3. Verifica que los 7 comandos de la sección 4 funcionan
 4. Comparte el repo con el correo del instructor
 5. Tag de release `v1.0.0` apuntando al commit final
 
----
+**Fecha límite:** 2 semanas desde que recibes el enunciado.
+
+**Dudas:** canal `#trabajo-modulo-1` de Slack. Estamos para ayudar a desbloquear, no para resolver el ejercicio.
 
 ¡Adelante!
