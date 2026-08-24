@@ -9,7 +9,7 @@
 
 ## 1 · Contexto
 
-Eres parte del equipo de plataforma de **AcmeOMS**, un SaaS que gestiona pedidos para tiendas online. El documento de arquitectura del sistema (lo tienes en el material del curso, `03-arquitectura.md`) describe el OMS como un **monolito modular** desplegado en dos regiones, con seis bounded contexts (Catalog, Inventory, Orders, Payments, Billing, IAM), persistencia en PostgreSQL multi-AZ, caché en Redis, y pagos delegados a Stripe.
+Eres parte del equipo de plataforma de **AcmeOMS**, un SaaS que gestiona pedidos para tiendas online. El documento de arquitectura del sistema (lo tienes en el material del curso, `anexo-arquitectura/03-arquitectura.md`) describe el OMS como un **monolito modular** desplegado en dos regiones, con seis bounded contexts (Catalog, Inventory, Orders, Payments, Billing, IAM), persistencia en PostgreSQL multi-AZ, caché en Redis, y pagos delegados a Stripe.
 
 **Tu trabajo en este bloque NO es implementar la aplicación** —eso vendrá en bloques posteriores—. **Tu trabajo es provisionar y operar la infraestructura** que la va a alojar. Para esto vas a usar todo lo que aprendiste en los cinco vídeos: Docker, Cloud (GCP), Terraform, CI/CD avanzado y Ansible.
 
@@ -78,7 +78,7 @@ Construir, con **Terraform** y **Ansible**, un subconjunto operativo de la plata
 
 ## 3 · Restricciones de la spec que tienes que cumplir
 
-Las que están escritas en `01-inventario-restricciones.md` del proyecto original. Para tu trabajo, son **innegociables**:
+Las que están escritas en `anexo-arquitectura/01-inventario-restricciones.md` del proyecto original. Para tu trabajo, son **innegociables**:
 
 ### Cumplimiento regulatorio
 - **REG-GDPR-001** — Despliegue solo en regiones europeas (`europe-west3` obligatoria; `europe-central2` opcional para el bonus DR)
