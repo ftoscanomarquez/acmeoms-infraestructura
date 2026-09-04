@@ -1,5 +1,8 @@
 # m2-4-plataforma-e-infraestructura
 
+📄 **El enunciado del trabajo está en [Trabajo - enunciado.md](./Trabajo%20-%20enunciado.md)** — léelo primero: es la guía principal de lo que se pide.
+
+
 <!-- BEGIN cc:que-se-valora -->
 ¡Hola! Para que tengas claro qué busco al corregir tu proyecto "m2-4-plataforma-e-infraestructura", aquí te dejo una guía de lo que más valoro.
 
