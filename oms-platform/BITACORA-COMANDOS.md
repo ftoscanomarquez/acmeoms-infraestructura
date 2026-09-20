@@ -546,8 +546,6 @@ Ambos buckets creados en `europe-west3`, con acceso uniforme y versionado activo
 
 **Estado:** ✅ hecho — 2026-09-21. **Fase 0 completa al 100%.**
 
-**Estado:** ⏳ pendiente — a decidir si se usa un bucket por proyecto (staging/production) o uno compartido con prefijos distintos por entorno (`terraform/main.tf` ya prevé `prefix = "oms-platform/${var.env}"`).
-
 ---
 
 ## Notas generales de la Fase 0
