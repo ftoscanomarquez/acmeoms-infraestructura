@@ -8,11 +8,9 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 0 — Cuentas, accesos y doble remoto (casi completa, quedan 2 puntos)
-**Último hito completado:** `gcloud` autenticado completamente en WSL2/Ubuntu: login personal (`francisco.alberto.tm@gmail.com`) y Application Default Credentials (ADC) configuradas con quota project `acmeoms-staging-fatm`. Se resolvieron 2 incidentes de OAuth en el camino (ver BITACORA-COMANDOS.md sección 0.6).
-**Siguiente paso concreto (para retomar):** Habilitar las APIs necesarias (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry) en ambos proyectos GCP (`acmeoms-staging-fatm` y `acmeoms-production-fatm`), y crear el bucket GCS de estado remoto de Terraform. Ambos comandos ya están redactados y listos en `oms-platform/BITACORA-COMANDOS.md` (secciones 0.6/0.7 restantes) — solo falta ejecutarlos.
-
-> ⏸️ **Sesión pausada aquí el 2026-09-20 (~04:15 am) por el usuario.** Para retomar: solo hace falta decir "continuemos" — este archivo y BITACORA-COMANDOS.md tienen todo el contexto necesario, no hace falta reexplicar nada de lo ya visto (diferencia Terraform/Ansible, WIF vs. ADC, revisiones/canary de Cloud Run, GKE Autopilot, bonus elegidos, etc.).
+**Fase en curso:** ✅ Fase 0 completa al 100% → arrancando Fase 1 (Terraform: red y datos)
+**Último hito completado:** Las 7 APIs de GCP habilitadas en ambos proyectos (`compute`, `sqladmin`, `run`, `redis`, `secretmanager`, `iamcredentials`, `artifactregistry`), y los 2 buckets de estado remoto de Terraform creados y versionados: `gs://acmeoms-staging-fatm-tfstate` y `gs://acmeoms-production-fatm-tfstate` (ambos en `europe-west3`).
+**Siguiente paso concreto:** Fase 1 — descomentar/completar el backend `gcs` en `terraform/main.tf`, luego completar el módulo `network` (subredes multi-zona, Cloud NAT, firewall) y ejecutar el primer `terraform init` + `plan`.
 
 ---
 
@@ -35,7 +33,7 @@
 
 ## 🗺️ Plan por fases
 
-### Fase 0 — Cuentas, accesos y doble remoto ⏳ EN CURSO
+### Fase 0 — Cuentas, accesos y doble remoto ✅ COMPLETA
 
 - [x] Crear repo nuevo y vacío en GitHub (`acmeoms-infraestructura`)
 - [x] `git remote add github <url>` sobre este mismo repo local (sin tocar `origin`)
@@ -45,8 +43,8 @@
 - [x] Crear proyecto GCP de producción (`acmeoms-production-fatm`)
 - [x] Instalar/verificar herramientas locales: `gcloud` 585.0.0 (Windows), `terraform` 1.15.8 (WSL/Ubuntu), `ansible-core` 2.20.1 (WSL/Ubuntu), `docker` 29.8.0, Python 3.14.4 (WSL/Ubuntu) — todas cumplen los mínimos del README
 - [x] `gcloud auth login` + `gcloud auth application-default login` (con quota project `acmeoms-staging-fatm`)
-- [ ] Habilitar APIs necesarias en ambos proyectos (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry, cloudkms si aplica CMEK)
-- [ ] Crear bucket GCS de estado remoto de Terraform (uno por proyecto o compartido con prefijos por entorno — decidir en el momento)
+- [x] Habilitar APIs necesarias en ambos proyectos: compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry (cloudkms pendiente para cuando se implemente el bonus CMEK en Fase 7)
+- [x] Crear bucket GCS de estado remoto de Terraform — uno por proyecto: `gs://acmeoms-staging-fatm-tfstate` y `gs://acmeoms-production-fatm-tfstate` (europe-west3, versionados)
 
 ### Fase 1 — Terraform: red y datos
 

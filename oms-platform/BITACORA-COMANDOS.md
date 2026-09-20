@@ -409,11 +409,33 @@ test -f /home/franc/.config/gcloud/application_default_credentials.json
 
 ---
 
-### 0.6 · Habilitar APIs de GCP necesarias
+### 0.9 · Habilitar APIs de GCP necesarias
 
-**Contexto:** cada servicio de GCP que se va a usar (Compute Engine, Cloud SQL, Cloud Run, Memorystore, Secret Manager, IAM Credentials, Artifact Registry) requiere que su API esté habilitada explícitamente en el proyecto antes de poder crear recursos con Terraform.
+**Contexto:** conviene aclarar primero una posible confusión de vocabulario. Una "API de GCP" en este contexto **no** es lo mismo que una API de negocio (ej. un `@RestController` de Spring MVC con su Service y Repository, expuesta por la propia aplicación). Cada servicio gestionado de Google Cloud (Cloud SQL, Cloud Run, Redis/Memorystore, Secret Manager, etc.) es, por debajo, una API REST que Google opera — pero esa API viene **desactivada por defecto** en cualquier proyecto nuevo, como medida de seguridad y control de costos. Es un interruptor binario (`ENABLED`/`DISABLED`) por proyecto y por servicio: antes de que Terraform pueda crear, por ejemplo, una instancia de Cloud SQL, el proyecto necesita tener habilitada explícitamente la API `sqladmin.googleapis.com`. Si no lo está, el primer intento de crear ese recurso falla con:
 
-**Comando (por cada proyecto, staging y producción):**
+```
+Error: googleapi: Error 403: Cloud SQL Admin API has not been used in project ... before or it is disabled
+```
+
+Analogía con desarrollo de aplicaciones: es equivalente a tener que activar una cuenta y una API Key en un proveedor externo (ej. Stripe) antes de que tu código pueda invocar `stripe.paymentIntents.create(...)` — un paso de habilitación previo, independiente de la lógica de negocio que luego se construye sobre él.
+
+**De dónde sale esta lista concreta de APIs** (no es arbitraria — se deriva 1 a 1 de: (a) el comando ya sugerido en `oms-platform/README.md`, y (b) los recursos `google_*` que ya están escritos en los 4 módulos de Terraform):
+
+| API | Por qué se necesita | Recursos de Terraform que la usan |
+|---|---|---|
+| `compute.googleapis.com` | VPC, subredes, IPs, firewall, Load Balancer | `google_compute_network`, `google_compute_subnetwork`, `google_compute_global_address`, `google_compute_backend_service`, etc. (módulos `network` y `compute`) |
+| `sqladmin.googleapis.com` | Cloud SQL (PostgreSQL) | `google_sql_database_instance`, `google_sql_database`, `google_sql_user` (módulo `database`) |
+| `run.googleapis.com` | Cloud Run | `google_cloud_run_v2_service` (módulo `compute`) |
+| `redis.googleapis.com` | Memorystore Redis | `google_redis_instance` (módulo `database`) |
+| `secretmanager.googleapis.com` | Secret Manager (password de la BD) | `google_secret_manager_secret` (módulo `database`) |
+| `iamcredentials.googleapis.com` | Necesaria para que WIF pueda generar tokens de acceso temporales para el Service Account de CI/CD | soporta `google_iam_workload_identity_pool_provider` (módulo `iam`) |
+| `artifactregistry.googleapis.com` | Repositorio de imágenes Docker (`image_repo` en `envs/*.tfvars` apunta a `europe-west3-docker.pkg.dev/...`); el módulo `iam` ya otorga `roles/artifactregistry.writer` al SA de CI/CD | usada en Fase 3 (build/push de la imagen) y ya asumida por el módulo `iam` |
+
+(Nota: `cloudkms.googleapis.com` se habilitará más adelante, solo si se llega a implementar el bonus de CMEK propia en la Fase 7 — no se activa aquí para no crear ruido en proyectos que quizá no lleguen a usarla.)
+
+**Decisión de ejecución:** un solo comando con las 7 APIs juntas (separadas por espacio, `gcloud services enable` acepta múltiples nombres en la misma invocación) — no una por una. Se ejecuta **dos veces**, una por proyecto (`--project=acmeoms-staging-fatm` y `--project=acmeoms-production-fatm`), porque cada proyecto GCP tiene sus propios interruptores, completamente independientes del otro.
+
+**Comando ejecutado (staging):**
 
 ```bash
 gcloud services enable \
@@ -424,32 +446,105 @@ gcloud services enable \
   secretmanager.googleapis.com \
   iamcredentials.googleapis.com \
   artifactregistry.googleapis.com \
-  --project=<ID-PROYECTO>
+  --project=acmeoms-staging-fatm
+```
+
+**Comando ejecutado (producción):**
+
+```bash
+gcloud services enable \
+  compute.googleapis.com \
+  sqladmin.googleapis.com \
+  run.googleapis.com \
+  redis.googleapis.com \
+  secretmanager.googleapis.com \
+  iamcredentials.googleapis.com \
+  artifactregistry.googleapis.com \
+  --project=acmeoms-production-fatm
 ```
 
 **Qué hace:** activa el acceso programático a esos servicios en el proyecto indicado. Sin esto, Terraform fallará con errores del tipo "API not enabled" al intentar crear el primer recurso de cada servicio.
 
-**Estado:** ⏳ pendiente.
+**Resultado obtenido (staging):**
+
+```
+Operation "operations/acf.p2-668851924327-a28ffe94-29c9-43ae-ae5f-ab2c425c5d9b" finished successfully.
+```
+
+Las 7 APIs quedaron habilitadas en `acmeoms-staging-fatm` sin errores. El comando tardó más de 2 minutos (normal, es la primera activación en un proyecto nuevo).
+
+**Resultado obtenido (producción):**
+
+```
+Operation "operations/acf.p2-982350171486-5b91bdf0-76c8-49c9-9b27-cfa9ca127af6" finished successfully.
+```
+
+Las 7 APIs quedaron habilitadas en `acmeoms-production-fatm` sin errores.
+
+**Estado:** ✅ hecho en ambos proyectos — 2026-09-21.
 
 ---
 
 ### 0.7 · Crear bucket de estado remoto de Terraform
 
-**Contexto:** Terraform necesita guardar su "estado" (qué recursos existen y su configuración actual) en algún lugar persistente y compartible. Por defecto lo guarda en un archivo local (`terraform.tfstate`), lo cual es peligroso (se puede perder, no es compartible en equipo, puede contener datos sensibles sin cifrar). Se usa un bucket de Google Cloud Storage como backend remoto.
+**Contexto — para qué sirve el "estado" de Terraform:** cuando Terraform crea infraestructura, necesita llevar un registro de qué existe y cómo está configurado — el "estado" (`terraform.tfstate`, un archivo JSON). Es la única forma en que Terraform distingue "esto ya existe, no lo toques" de "esto es nuevo, hay que crearlo", y "esto cambió en el código, hay que actualizarlo" de "esto se borró del código, hay que destruirlo".
 
-**Comando previsto:**
+**Por qué no se deja como archivo local (comportamiento por defecto):**
+1. **Se puede perder** — si se borra la carpeta o se pierde el archivo, Terraform "olvida" que la infraestructura existe y en el siguiente `apply` intentaría crear todo de nuevo, chocando con lo que ya existe en GCP.
+2. **No es compartible** — otra máquina (o los runners de GitHub Actions en la Fase 6) no tendría ese archivo y no sabría qué ya existe.
+3. **Puede contener datos sensibles sin cifrar** en texto plano dentro del JSON.
+4. **Sin bloqueo de concurrencia** — dos ejecuciones simultáneas con estado local podrían corromper el registro.
 
-```bash
-gcloud storage buckets create gs://<tu-proyecto>-tfstate \
-  --location=europe-west3 --uniform-bucket-level-access
+**Solución:** backend remoto en un bucket de Google Cloud Storage (persistente, versionado, con bloqueo de concurrencia nativo) — es justo lo que ya está preparado, comentado, en `terraform/main.tf`:
 
-gcloud storage buckets update gs://<tu-proyecto>-tfstate --versioning
+```hcl
+# terraform {
+#   backend "gcs" {
+#     bucket = "<tu-proyecto>-tfstate"
+#     prefix = "oms-platform/${var.env}"
+#   }
+# }
 ```
 
-**Qué hace:**
-- `buckets create` — crea el bucket en la región `europe-west3` (misma región que la infraestructura, por REG-GDPR-001).
-- `--uniform-bucket-level-access` — fuerza que el control de acceso sea uniforme a nivel de bucket (más seguro que ACLs por objeto).
-- `buckets update --versioning` — activa versionado de objetos, para poder recuperar un estado anterior si algo se corrompe.
+**Decisión: un bucket por proyecto** (no uno compartido con prefijos), coherente con la decisión ya tomada de aislamiento total entre entornos (proyecto GCP separado por ambiente). Así, el estado de producción nunca es accesible ni modificable desde el proyecto de staging, ni comparte permisos IAM entre ambos.
+
+**Comandos ejecutados:**
+
+```bash
+# Bucket de staging
+gcloud storage buckets create gs://acmeoms-staging-fatm-tfstate \
+  --project=acmeoms-staging-fatm \
+  --location=europe-west3 --uniform-bucket-level-access
+
+# Bucket de producción
+gcloud storage buckets create gs://acmeoms-production-fatm-tfstate \
+  --project=acmeoms-production-fatm \
+  --location=europe-west3 --uniform-bucket-level-access
+
+# Versionado en ambos (permite recuperar un estado anterior si se corrompe)
+gcloud storage buckets update gs://acmeoms-staging-fatm-tfstate --versioning
+gcloud storage buckets update gs://acmeoms-production-fatm-tfstate --versioning
+```
+
+**Qué hace cada flag:**
+- `buckets create` — crea el bucket en la región `europe-west3` (misma región que el resto de la infraestructura, por REG-GDPR-001 — el estado de Terraform también puede contener datos sensibles, así que debe respetar la misma restricción de residencia de datos).
+- `--uniform-bucket-level-access` — fuerza que el control de acceso sea uniforme a nivel de bucket vía IAM (más seguro y simple de auditar que ACLs por objeto individual).
+- `buckets update --versioning` — activa versionado de objetos: cada sobrescritura del `tfstate` guarda la versión anterior, permitiendo revertir si un `apply` deja el estado en mal estado.
+
+**Resultado obtenido:**
+
+```
+Creating gs://acmeoms-staging-fatm-tfstate/...
+Creating gs://acmeoms-production-fatm-tfstate/...
+Updating gs://acmeoms-staging-fatm-tfstate/... (versioning)
+Updating gs://acmeoms-production-fatm-tfstate/... (versioning)
+```
+
+Ambos buckets creados en `europe-west3`, con acceso uniforme y versionado activo, sin errores.
+
+**Pendiente para la Fase 1:** descomentar y completar el bloque `backend "gcs"` en `terraform/main.tf`, y ejecutar `terraform init -backend-config="bucket=acmeoms-staging-fatm-tfstate"` (staging) o el bucket de producción según el entorno — recordar que, según el propio comentario del archivo, el backend no admite variables de Terraform, así que el nombre del bucket se parametriza con `-backend-config` en el momento del `init`, no con `var.project_id`.
+
+**Estado:** ✅ hecho — 2026-09-21. **Fase 0 completa al 100%.**
 
 **Estado:** ⏳ pendiente — a decidir si se usa un bucket por proyecto (staging/production) o uno compartido con prefijos distintos por entorno (`terraform/main.tf` ya prevé `prefix = "oms-platform/${var.env}"`).
 
