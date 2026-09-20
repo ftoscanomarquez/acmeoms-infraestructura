@@ -8,9 +8,11 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 0 — Cuentas, accesos y doble remoto
+**Fase en curso:** Fase 0 — Cuentas, accesos y doble remoto (casi completa, quedan 2 puntos)
 **Último hito completado:** `gcloud` autenticado completamente en WSL2/Ubuntu: login personal (`francisco.alberto.tm@gmail.com`) y Application Default Credentials (ADC) configuradas con quota project `acmeoms-staging-fatm`. Se resolvieron 2 incidentes de OAuth en el camino (ver BITACORA-COMANDOS.md sección 0.6).
-**Siguiente paso concreto:** Habilitar las APIs necesarias (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry) en ambos proyectos GCP, y crear el bucket GCS de estado remoto de Terraform.
+**Siguiente paso concreto (para retomar):** Habilitar las APIs necesarias (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry) en ambos proyectos GCP (`acmeoms-staging-fatm` y `acmeoms-production-fatm`), y crear el bucket GCS de estado remoto de Terraform. Ambos comandos ya están redactados y listos en `oms-platform/BITACORA-COMANDOS.md` (secciones 0.6/0.7 restantes) — solo falta ejecutarlos.
+
+> ⏸️ **Sesión pausada aquí el 2026-09-20 (~04:15 am) por el usuario.** Para retomar: solo hace falta decir "continuemos" — este archivo y BITACORA-COMANDOS.md tienen todo el contexto necesario, no hace falta reexplicar nada de lo ya visto (diferencia Terraform/Ansible, WIF vs. ADC, revisiones/canary de Cloud Run, GKE Autopilot, bonus elegidos, etc.).
 
 ---
 
