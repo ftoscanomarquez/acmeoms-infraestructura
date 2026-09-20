@@ -9,8 +9,8 @@
 ## 📍 Estado actual
 
 **Fase en curso:** Fase 0 — Cuentas, accesos y doble remoto
-**Último hito completado:** Crédito "Comenzar gratis" activado (100% disponible, $5,089.20) y ambos proyectos GCP creados y vinculados a facturación: `acmeoms-staging-fatm` y `acmeoms-production-fatm`.
-**Siguiente paso concreto:** Instalar `gcloud` CLI en el equipo local (no estaba instalado), autenticarse, y habilitar las APIs necesarias en ambos proyectos.
+**Último hito completado:** Todas las herramientas locales verificadas y funcionando: `gcloud` 585.0.0 instalado y añadido al PATH (Windows/Git Bash), Docker Desktop reparado (incidente de integración WSL resuelto con `wsl --shutdown`), y descubierto que Terraform 1.15.8, Ansible-core 2.20.1 y Python 3.14.4 ya estaban instalados en WSL2/Ubuntu. Se decidió ejecutar Terraform y Ansible dentro de WSL2/Ubuntu de aquí en adelante.
+**Siguiente paso concreto:** Autenticar `gcloud` (`gcloud auth login` + `application-default login`) y habilitar las APIs necesarias en ambos proyectos GCP.
 
 ---
 
@@ -41,7 +41,7 @@
 - [x] Activar "Comenzar gratis" en GCP (crédito Free Trial: 100% disponible, $5,089.20)
 - [x] Crear proyecto GCP de staging (`acmeoms-staging-fatm`)
 - [x] Crear proyecto GCP de producción (`acmeoms-production-fatm`)
-- [ ] Instalar/verificar herramientas locales: `gcloud`, `terraform` (≥1.7), `ansible-core` (≥2.16), `docker` (≥24), Python (≥3.10) — **`gcloud` no está instalado, pendiente**
+- [x] Instalar/verificar herramientas locales: `gcloud` 585.0.0 (Windows), `terraform` 1.15.8 (WSL/Ubuntu), `ansible-core` 2.20.1 (WSL/Ubuntu), `docker` 29.8.0, Python 3.14.4 (WSL/Ubuntu) — todas cumplen los mínimos del README
 - [ ] `gcloud auth login` + `gcloud auth application-default login`
 - [ ] Habilitar APIs necesarias en ambos proyectos (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry, cloudkms si aplica CMEK)
 - [ ] Crear bucket GCS de estado remoto de Terraform (uno por proyecto o compartido con prefijos por entorno — decidir en el momento)

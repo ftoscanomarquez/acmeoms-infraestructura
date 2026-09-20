@@ -184,7 +184,138 @@ docker version
 python3 --version
 ```
 
-**Estado:** ⏳ pendiente de ejecutar.
+**Resultado de la primera verificación (todas las herramientas):**
+
+```bash
+gcloud version    # → command not found (no instalado)
+terraform version # → command not found (no instalado)
+ansible --version # → command not found (no instalado)
+docker version    # → cliente instalado (v29.2.1) pero daemon caído
+python3 --version # → no instalado (solo alias de Microsoft Store)
+```
+
+**Hallazgo — PATH y terminal en Windows + VS Code:**
+
+Al instalar un programa en Windows, el instalador agrega su carpeta al `PATH` del **sistema**, pero **los procesos de terminal ya abiertos no releen esa variable automáticamente** — solo la leen una vez, al arrancar. Como Claude Code ejecuta comandos a través de una sesión de Git Bash que ya estaba corriendo antes de instalar `gcloud`, esa sesión no lo "vería" hasta refrescar su entorno.
+
+**Solución aplicada:** no es necesario cerrar/reiniciar VS Code ni la sesión de Claude Code (el contexto de la conversación vive en el proceso de Claude Code, no en el proceso de Bash). Basta con refrescar el `PATH` dentro de la sesión de Bash existente, o abrir una sub-terminal nueva que sí lea el `PATH` actualizado de Windows. Si el refresco simple no detecta el binario, la alternativa es invocar `gcloud` con su ruta completa de instalación (normalmente `C:\Users\<usuario>\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd`) hasta que se confirme el PATH correcto.
+
+**Instalación realizada:** instalador oficial `.exe` descargado desde `cloud.google.com/sdk/docs/install`, ejecutado por el usuario. El propio instalador abrió una terminal CMD nueva confirmando "Welcome to the Google Cloud CLI!" (esa terminal, al ser un proceso nuevo, sí detecta el PATH actualizado de Windows).
+
+**Verificación en la sesión de Bash de Claude Code (la que ya estaba abierta antes de instalar):**
+
+```bash
+gcloud version
+# → /usr/bin/bash: line 1: gcloud: command not found   (esperado, confirma el problema de PATH explicado arriba)
+```
+
+**Solución aplicada (sin cerrar VS Code ni la sesión):**
+
+```bash
+# 1. Localizar el binario instalado
+ls "/c/Users/franc/AppData/Local/Google/Cloud SDK/google-cloud-sdk/bin/"
+# → confirma que gcloud, gcloud.cmd, gsutil, bq, etc. sí existen ahí
+
+# 2. Añadir esa carpeta al PATH de la sesión actual (efecto inmediato, solo dura esta sesión de Bash)
+export PATH="$PATH:/c/Users/franc/AppData/Local/Google/Cloud SDK/google-cloud-sdk/bin"
+gcloud version
+# → Google Cloud SDK 585.0.0 (cumple de sobra el mínimo ≥470 del README)
+
+# 3. Persistir el PATH para futuras sesiones de Bash (aunque se reinicie la terminal, no VS Code)
+echo 'export PATH="$PATH:/c/Users/franc/AppData/Local/Google/Cloud SDK/google-cloud-sdk/bin"' >> ~/.bashrc
+```
+
+**Resultado obtenido:** `gcloud` detectado y funcional en la sesión de Claude Code sin reiniciar VS Code ni perder el contexto de la conversación. Persistido en `~/.bashrc` para que futuras terminales de Git Bash también lo detecten automáticamente.
+
+**Estado (gcloud):** ✅ hecho — 2026-09-20.
+
+---
+
+### 0.5b · Incidente: Docker Desktop no arrancaba (integración WSL rota)
+
+**Contexto:** al verificar `docker version`, el cliente Docker (v29.2.1) respondía pero fallaba la conexión al daemon: `failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine`. Al abrir la aplicación Docker Desktop manualmente, mostró el error:
+
+```
+WSL integration with distro 'Ubuntu' unexpectedly stopped. Do you want to restart it?
+
+running wsl distro proxy in Ubuntu distro: running proxy: running wslexec: ...
+getting settings from backend: Get "http://ipc/app/settings/flat": dial unix /mnt/wsl/docker-desktop/shared-sockets/host-services/backend.sock: connect: no such file or directory
+```
+
+**Causa probable:** una actualización de Windows ocurrida justo antes dejó la integración de Docker Desktop con la distro WSL2 `Ubuntu` en un estado inconsistente (el proxy interno de Docker dentro de esa distro no lograba reconectar con el backend del host).
+
+**Intentos de solución, en orden:**
+
+1. **Botón "Restart it" del propio diálogo de Docker Desktop** → ❌ no resolvió el problema, el error persistió.
+2. **Reinicio manual del subsistema WSL completo** (no afecta a Windows en general, ni a VS Code, ni a la sesión de Claude Code — solo a las distros Linux virtualizadas y lo que dependa de ellas):
+
+   ```bash
+   # Desde Git Bash, invocando las herramientas nativas de Windows:
+   powershell.exe -Command "wsl --shutdown"
+   powershell.exe -Command "wsl --status"   # confirma: Ubuntu / WSL versión 2
+   ```
+
+3. Reabrir Docker Desktop manualmente desde el menú de Windows → ✅ arrancó correctamente esta vez.
+
+**Verificación final:**
+
+```bash
+docker version
+# → Client v29.8.0, Server (Docker Desktop 4.91.0) v29.8.0 — ambos respondiendo correctamente
+```
+
+(Nota: la versión subió de 29.2.1 a 29.8.0 respecto a la primera verificación — la actualización de Windows aparentemente disparó también una actualización de Docker Desktop al reiniciarse.)
+
+**Lección para reproducir esto en el futuro:** si Docker Desktop falla con un error de "WSL integration ... unexpectedly stopped" tras una actualización de Windows, el botón de reinicio del propio diálogo no siempre basta — `wsl --shutdown` seguido de reabrir Docker Desktop es la solución confiable.
+
+**Estado (Docker):** ✅ hecho — 2026-09-20.
+
+---
+
+### 0.5c · Descubrimiento: Terraform, Ansible y Python ya estaban instalados en WSL2/Ubuntu
+
+**Contexto:** se decidió (ver sección de decisiones en `PROGRESO.md`) instalar y ejecutar Terraform y Ansible dentro de WSL2/Ubuntu en vez de nativo en Windows, porque Ansible es más estable en Linux (su propia documentación lo recomienda) y Docker Desktop ya usa esa misma distro `Ubuntu` como backend.
+
+**Verificación ejecutada:**
+
+```bash
+# Listar distros WSL y confirmar que Ubuntu está corriendo
+powershell.exe -Command "wsl -l -v"
+# → Ubuntu (Running, versión 2) es la distro por defecto
+
+# Ejecutar comandos dentro de la distro Ubuntu desde Git Bash de Windows,
+# sin necesidad de abrir una terminal WSL aparte:
+wsl.exe -d Ubuntu -e bash -c "whoami && python3 --version && which terraform && which ansible"
+```
+
+**Resultado — sorpresa positiva: ya estaban instalados** (probablemente de trabajo previo del usuario en otros proyectos, ej. `cc-s02-infra-traefik` visible en las rutas montadas de Docker):
+
+| Herramienta | Versión en WSL/Ubuntu | Mínimo exigido (README `oms-platform`) | Cumple |
+|---|---|---|---|
+| `gcloud` | 585.0.0 | ≥ 470 | ✅ |
+| `terraform` | 1.15.8 | ≥ 1.7 | ✅ (hay 1.16.3 disponible, no obligatorio actualizar; `required_version = ">= 1.7.0"` en `versions.tf` lo acepta) |
+| `ansible-core` | 2.20.1 | ≥ 2.16 | ✅ |
+| `docker` (cliente WSL) | 29.1.3 | ≥ 24 | ✅ |
+| `docker` (servidor/Desktop) | 29.8.0 | ≥ 24 | ✅ |
+| Python | 3.14.4 | ≥ 3.10 | ✅ |
+
+**Comando usado para verificar versiones completas:**
+
+```bash
+wsl.exe -d Ubuntu -e bash -c "terraform version; echo; ansible --version; echo; docker version; echo; gcloud version"
+```
+
+**Decisión operativa a partir de ahora:** todos los comandos de `terraform` y `ansible` de este proyecto (Fases 1 en adelante) se ejecutan **dentro de WSL2/Ubuntu**, invocados desde la terminal de Claude Code (Git Bash) con el patrón:
+
+```bash
+wsl.exe -d Ubuntu -e bash -c "cd /ruta/al/proyecto && <comando>"
+```
+
+o entrando directamente a una sesión interactiva de esa distro cuando convenga. El repositorio de trabajo (`D:\CodeCrypto\cc-s12-infraestructura`) es accesible desde WSL vía `/mnt/d/CodeCrypto/cc-s12-infraestructura`.
+
+`gcloud` y Docker CLI están disponibles **tanto en Windows/Git Bash como en WSL/Ubuntu** (cada sistema tiene su propia instalación o acceso al mismo daemon); no hay conflicto entre usarlos desde uno u otro lado.
+
+**Estado:** ✅ hecho — 2026-09-20. No fue necesario instalar nada adicional para Terraform/Ansible/Python.
 
 ---
 
