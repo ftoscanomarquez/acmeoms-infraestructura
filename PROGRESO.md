@@ -9,8 +9,8 @@
 ## 📍 Estado actual
 
 **Fase en curso:** Fase 0 — Cuentas, accesos y doble remoto
-**Último hito completado:** Ninguno todavía — plan acordado, documentos de seguimiento creados.
-**Siguiente paso concreto:** Activar "Comenzar gratis" en GCP y crear los dos proyectos (staging/producción).
+**Último hito completado:** Crédito "Comenzar gratis" activado (100% disponible, $5,089.20) y ambos proyectos GCP creados y vinculados a facturación: `acmeoms-staging-fatm` y `acmeoms-production-fatm`.
+**Siguiente paso concreto:** Instalar `gcloud` CLI en el equipo local (no estaba instalado), autenticarse, y habilitar las APIs necesarias en ambos proyectos.
 
 ---
 
@@ -35,16 +35,16 @@
 
 ### Fase 0 — Cuentas, accesos y doble remoto ⏳ EN CURSO
 
-- [ ] Activar "Comenzar gratis" en GCP (créditos $300 / 90 días)
-- [ ] Crear proyecto GCP de staging
-- [ ] Crear proyecto GCP de producción
-- [ ] Instalar/verificar herramientas locales: `gcloud`, `terraform` (≥1.7), `ansible-core` (≥2.16), `docker` (≥24), Python (≥3.10)
+- [x] Crear repo nuevo y vacío en GitHub (`acmeoms-infraestructura`)
+- [x] `git remote add github <url>` sobre este mismo repo local (sin tocar `origin`)
+- [x] Confirmar que `PROGRESO.md` y `BITACORA-COMANDOS.md` están creados y en uso
+- [x] Activar "Comenzar gratis" en GCP (crédito Free Trial: 100% disponible, $5,089.20)
+- [x] Crear proyecto GCP de staging (`acmeoms-staging-fatm`)
+- [x] Crear proyecto GCP de producción (`acmeoms-production-fatm`)
+- [ ] Instalar/verificar herramientas locales: `gcloud`, `terraform` (≥1.7), `ansible-core` (≥2.16), `docker` (≥24), Python (≥3.10) — **`gcloud` no está instalado, pendiente**
 - [ ] `gcloud auth login` + `gcloud auth application-default login`
 - [ ] Habilitar APIs necesarias en ambos proyectos (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry, cloudkms si aplica CMEK)
 - [ ] Crear bucket GCS de estado remoto de Terraform (uno por proyecto o compartido con prefijos por entorno — decidir en el momento)
-- [ ] Crear repo nuevo y vacío en GitHub
-- [ ] `git remote add github <url>` sobre este mismo repo local (sin tocar `origin`)
-- [ ] Confirmar que `PROGRESO.md` y `BITACORA-COMANDOS.md` están creados y en uso
 
 ### Fase 1 — Terraform: red y datos
 
