@@ -9,8 +9,8 @@
 ## 📍 Estado actual
 
 **Fase en curso:** Fase 0 — Cuentas, accesos y doble remoto
-**Último hito completado:** Todas las herramientas locales verificadas y funcionando: `gcloud` 585.0.0 instalado y añadido al PATH (Windows/Git Bash), Docker Desktop reparado (incidente de integración WSL resuelto con `wsl --shutdown`), y descubierto que Terraform 1.15.8, Ansible-core 2.20.1 y Python 3.14.4 ya estaban instalados en WSL2/Ubuntu. Se decidió ejecutar Terraform y Ansible dentro de WSL2/Ubuntu de aquí en adelante.
-**Siguiente paso concreto:** Autenticar `gcloud` (`gcloud auth login` + `application-default login`) y habilitar las APIs necesarias en ambos proyectos GCP.
+**Último hito completado:** `gcloud` autenticado completamente en WSL2/Ubuntu: login personal (`francisco.alberto.tm@gmail.com`) y Application Default Credentials (ADC) configuradas con quota project `acmeoms-staging-fatm`. Se resolvieron 2 incidentes de OAuth en el camino (ver BITACORA-COMANDOS.md sección 0.6).
+**Siguiente paso concreto:** Habilitar las APIs necesarias (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry) en ambos proyectos GCP, y crear el bucket GCS de estado remoto de Terraform.
 
 ---
 
@@ -42,7 +42,7 @@
 - [x] Crear proyecto GCP de staging (`acmeoms-staging-fatm`)
 - [x] Crear proyecto GCP de producción (`acmeoms-production-fatm`)
 - [x] Instalar/verificar herramientas locales: `gcloud` 585.0.0 (Windows), `terraform` 1.15.8 (WSL/Ubuntu), `ansible-core` 2.20.1 (WSL/Ubuntu), `docker` 29.8.0, Python 3.14.4 (WSL/Ubuntu) — todas cumplen los mínimos del README
-- [ ] `gcloud auth login` + `gcloud auth application-default login`
+- [x] `gcloud auth login` + `gcloud auth application-default login` (con quota project `acmeoms-staging-fatm`)
 - [ ] Habilitar APIs necesarias en ambos proyectos (compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry, cloudkms si aplica CMEK)
 - [ ] Crear bucket GCS de estado remoto de Terraform (uno por proyecto o compartido con prefijos por entorno — decidir en el momento)
 
@@ -118,7 +118,9 @@ _(vacío por ahora — se va llenando conforme avancemos)_
 
 | Fecha | Fase | Problema encontrado | Cómo se resolvió | Detalle completo |
 |-------|------|---------------------|-------------------|-------------------|
-| — | — | — | — | — |
+| 2026-09-20 | Fase 0 | `gcloud` no detectado en la sesión de Bash tras instalar el SDK (problema de PATH) | `export PATH=...` + persistido en `~/.bashrc`, sin reiniciar VS Code | BITACORA-COMANDOS.md § 0.5 |
+| 2026-09-20 | Fase 0 | Docker Desktop no arrancaba: "WSL integration with distro 'Ubuntu' unexpectedly stopped" tras actualización de Windows | `wsl --shutdown` + reabrir Docker Desktop | BITACORA-COMANDOS.md § 0.5b |
+| 2026-09-20 | Fase 0 | `gcloud auth application-default login --no-launch-browser`: primero `Scope has changed` (consentimiento incompleto), luego `Error 400: Missing required parameter: redirect_uri` al usar mal el modo `--remote-bootstrap` | Usar el flujo normal sin `--no-browser` (WSL2 reenvía `localhost:8085` automáticamente al navegador de Windows) | BITACORA-COMANDOS.md § 0.6 |
 
 ---
 

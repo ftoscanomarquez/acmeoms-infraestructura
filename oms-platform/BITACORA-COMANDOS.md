@@ -319,6 +319,96 @@ o entrando directamente a una sesión interactiva de esa distro cuando convenga.
 
 ---
 
+### 0.6 · Autenticación de gcloud (login personal + Application Default Credentials)
+
+**Contexto:** antes de que Terraform o Ansible puedan hablar con la API de GCP, es necesario autenticar la máquina. Son **dos autenticaciones distintas y complementarias**, no alternativas:
+
+| | `gcloud auth login` | `gcloud auth application-default login` (ADC) |
+|---|---|---|
+| ¿Quién se autentica? | El usuario, para ejecutar comandos `gcloud ...` manualmente | Cualquier librería/herramienta (Terraform, SDKs) que busque credenciales automáticamente |
+| Se guarda en | Configuración interna de `gcloud` | `~/.config/gcloud/application_default_credentials.json` |
+| Lo usa | Tú, desde la terminal | El `provider "google"` de `terraform/main.tf` |
+
+Esto **no es lo mismo que WIF** (Workload Identity Federation, que autentica al pipeline de GitHub Actions sin intervención humana). Es la autenticación humana previa necesaria para poder ejecutar `terraform apply` manualmente y, con ello, construir la infraestructura de WIF (módulo `iam`) que más adelante usará el pipeline por sí solo, sin login humano.
+
+**Decisión:** ambos logins se ejecutan dentro de WSL2/Ubuntu (consistente con la decisión de correr Terraform/Ansible ahí), en una terminal Ubuntu abierta directamente por el usuario (no vía `wsl.exe -e` desde Claude Code, porque el intercambio OAuth requiere una sesión interactiva real que la herramienta de ejecución de comandos de Claude Code no soporta — intentarlo produce `ERROR: gcloud crashed (EOFError): EOF when reading a line`).
+
+**Comando 1 — login personal:**
+
+```bash
+gcloud auth login
+```
+
+Resultado: completado sin incidentes tras seleccionar la cuenta `francisco.alberto.tm@gmail.com` y aceptar los permisos en el navegador.
+
+**Comando 2 — Application Default Credentials (ADC), con incidentes:**
+
+```bash
+gcloud auth application-default login --no-launch-browser
+```
+
+**Incidente A:** al ejecutarlo con `--no-browser`, tras pegar la URL completa de respuesta (`https://localhost:8085/?state=...&code=...`) en el prompt "Enter the output of the above command", gcloud abortó con:
+
+```
+ERROR: gcloud crashed (Warning): Scope has changed from "https://www.googleapis.com/auth/sqlservice.login openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform" to "openid https://www.googleapis.com/auth/userinfo.email".
+```
+
+Es decir, el consentimiento otorgado en el navegador no incluyó todos los scopes pedidos (probablemente por no marcar todas las casillas de permisos, o por cierre prematuro del flujo).
+
+**Incidente B:** en el segundo intento, gcloud generó un comando con `--remote-bootstrap="https://accounts.google.com/o/oauth2/auth?...&token_usage=remote"` (pensado para autenticar desde una máquina *sin* navegador, copiando ese comando completo a otra máquina que sí lo tenga). Al pegar solo el **fragmento de URL interna** directamente en el navegador (en lugar de tratarlo como parte de un comando gcloud a ejecutar), Google devolvió:
+
+```
+Error 400: invalid_request — Missing required parameter: redirect_uri
+```
+
+porque esa URL, aislada de su contexto de comando, no llevaba el `redirect_uri` que sí incluye el flujo normal.
+
+**Solución aplicada:** abandonar el modo `--no-browser`/`--remote-bootstrap` y usar el comando simple, dejando que WSL2 reenvíe automáticamente `localhost:8085` desde el navegador de Windows hacia el proceso dentro de la distro (WSL2 moderno soporta este reenvío de forma nativa):
+
+```bash
+gcloud auth application-default login
+```
+
+Resultado: `Your browser has been opened to visit: https://accounts.google.com/...` → login y consentimiento completos en el navegador de Windows → la terminal de Ubuntu recibió la respuesta correctamente vía `localhost:8085`:
+
+```
+Credentials saved to file: [/home/franc/.config/gcloud/application_default_credentials.json]
+These credentials will be used by any library that requests Application Default Credentials (ADC).
+WARNING:
+Cannot find a quota project to add to ADC. You might receive a "quota exceeded" or "API not enabled" error. Run $ gcloud auth application-default set-quota-project to add a quota project.
+```
+
+**Comando 3 — asignar quota project** (necesario: sin esto, las librerías que usan ADC no saben a qué proyecto de GCP facturar/contar las llamadas a la API, y podrían fallar con "quota exceeded" o "API not enabled"):
+
+```bash
+gcloud auth application-default set-quota-project acmeoms-staging-fatm
+```
+
+Resultado:
+```
+Credentials saved to file: [/home/franc/.config/gcloud/application_default_credentials.json]
+Quota project "acmeoms-staging-fatm" was added to ADC which can be used by Google client libraries for billing and quota. Note that some services may still bill the project owning the resource.
+```
+
+**Verificación final ejecutada:**
+
+```bash
+gcloud auth list
+# → ACTIVE: * / ACCOUNT: francisco.alberto.tm@gmail.com
+
+gcloud config list
+# → [core] account = francisco.alberto.tm@gmail.com / configuración activa: [default]
+
+test -f /home/franc/.config/gcloud/application_default_credentials.json
+# → el archivo existe
+```
+
+**Lección para reproducir esto en el futuro:** en WSL2, usar siempre el flujo normal de `gcloud auth login` / `gcloud auth application-default login` (sin `--no-browser` ni `--remote-bootstrap`) mientras el reenvío de `localhost` a Windows funcione — es más simple y menos propenso a errores que el modo manual de copiar/pegar URLs y códigos. El modo `--no-browser` solo es necesario en entornos verdaderamente sin navegador disponible (ej. un servidor remoto sin interfaz gráfica).
+
+**Estado:** ✅ hecho — 2026-09-20. Login personal y ADC configurados correctamente, con quota project `acmeoms-staging-fatm`.
+
+---
+
 ### 0.6 · Habilitar APIs de GCP necesarias
 
 **Contexto:** cada servicio de GCP que se va a usar (Compute Engine, Cloud SQL, Cloud Run, Memorystore, Secret Manager, IAM Credentials, Artifact Registry) requiere que su API esté habilitada explícitamente en el proyecto antes de poder crear recursos con Terraform.
