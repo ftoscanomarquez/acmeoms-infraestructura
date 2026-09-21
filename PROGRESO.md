@@ -8,9 +8,9 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 1 — Terraform: red y datos (5 de 6 puntos completos — falta solo verificación visual)
-**Último hito completado:** ✅ **Los 17 recursos de `network`+`database` fueron aplicados exitosamente en GCP staging real** (`acmeoms-staging-fatm`), en 3 tandas por dos hallazgos resueltos en el camino: (1) faltaba habilitar `servicenetworking.googleapis.com` en la Fase 0 (corregido en ambos proyectos), y (2) condición de carrera entre Cloud SQL/Redis y la conexión de peering — corregida con `depends_on` explícito entre módulos (nuevo output `private_vpc_connection_id` en `network`, nueva variable homónima en `database`). Outputs finales: `db_connection_name = "acmeoms-staging-fatm:europe-west3:oms-staging-postgres"`, `redis_host = "10.152.126.148"`. Verificación cruzada contra la API de GCP (no solo la salida de Terraform) en curso.
-**Siguiente paso concreto:** Confirmar la verificación cruzada por API, guiar al usuario para verificar visualmente en la consola web de GCP, y cerrar formalmente la Fase 1. Después: Fase 2 (completar `compute` e `iam`).
+**Fase en curso:** ✅ Fase 1 y Fase 2 COMPLETAS → arrancando Fase 3 (Ansible: staging)
+**Último hito completado:** **Los 38 recursos totales del proyecto están aplicados y verificados funcionalmente en GCP staging real** (`acmeoms-staging-fatm`): `network` (10) + `database` (7) + `compute` (10, incluye Artifact Registry y el binding IAM público) + `iam` (11). Cloud Run público y accesible: `https://oms-staging-7ifhynkuua-ey.a.run.app`. Load Balancer con IP fija `136.68.140.101` (certificado SSL en `PROVISIONING` hasta tener dominio real). Se resolvieron **7 hallazgos reales** durante el proceso (ver `BITACORA-COMANDOS.md` para el detalle completo de cada uno): 2 APIs de GCP faltantes en la Fase 0 (`servicenetworking`, `vpcaccess`), una condición de carrera de Terraform (`depends_on` explícito), un recurso creado a mano corregido a Terraform (Artifact Registry, señalado correctamente por el usuario), un problema de credenciales Docker en WSL (helper `.cmd` de Windows incompatible, resuelto con `docker-credential-gcr` nativo), una política IAM de Cloud Run vacía (agregado `roles/run.invoker` para `allUsers`), y el hallazgo más sutil: **`/healthz` es interceptado por Google Front End antes de llegar a Cloud Run** — se renombró el endpoint a `/health` en todo el proyecto (`server.js`, `Dockerfile`, Terraform, Ansible).
+**Siguiente paso concreto:** Fase 4 (Ansible: staging) — completar `deploy.yml`/`rollback.yml`/el role `oms_cloud_run`, y ejecutar el primer despliegue real con el `image_sha` corregido (`sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25`) para que `/health` sirva la respuesta correcta (`{"status":"ok"}`) en vez del contenido de la imagen anterior.
 
 ---
 
@@ -46,29 +46,30 @@
 - [x] Habilitar APIs necesarias en ambos proyectos: compute, sqladmin, run, redis, secretmanager, iamcredentials, artifactregistry (cloudkms pendiente para cuando se implemente el bonus CMEK en Fase 7)
 - [x] Crear bucket GCS de estado remoto de Terraform — uno por proyecto: `gs://acmeoms-staging-fatm-tfstate` y `gs://acmeoms-production-fatm-tfstate` (europe-west3, versionados)
 
-### Fase 1 — Terraform: red y datos
+### Fase 1 — Terraform: red y datos ✅ COMPLETA
 
 - [x] Completar módulo `network` (subredes multi-zona → reinterpretado como segmentación por propósito con subred `connector`; Cloud NAT; 3 reglas de firewall) — `terraform validate` exitoso en aislado
-- [x] `terraform validate` de network + database juntos desde la raíz (sin backend) → sin errores entre ambos (los únicos errores son en `compute`, pendiente de Fase 2)
+- [x] `terraform validate` de network + database juntos desde la raíz (sin backend) → sin errores entre ambos
 - [x] Completar módulo `database` (password vía `random_password` + Secret Manager — ya no texto plano; 3 `database_flags` de logging)
-- [ ] `terraform plan` con network + database (requiere backend gcs configurado y un `.tfvars`)
-- [ ] Primer `terraform apply` real a staging (network + database)
-- [ ] Verificar recursos creados en consola GCP
+- [x] `terraform plan` con network + database → limpio, 17 recursos
+- [x] Primer `terraform apply` real a staging (network + database) — 17/17 recursos creados (en 3 tandas por 2 hallazgos resueltos: API `servicenetworking` faltante, condición de carrera con `depends_on`)
+- [x] Verificar recursos creados: por API directa (`gcloud list`) y URLs de consola documentadas
 
-### Fase 2 — Terraform: cómputo e IAM
+### Fase 2 — Terraform: cómputo e IAM ✅ COMPLETA
 
-- [ ] Completar módulo `compute` (probes, VPC connector, certificado SSL + proxy HTTPS + forwarding rule)
-- [ ] Completar módulo `iam` (roles mínimos del SA de CI/CD)
-- [ ] `terraform apply` completo a staging
-- [ ] Verificar recursos en consola GCP
-- [ ] Segundo `terraform plan` → confirmar "No changes" (idempotencia)
+- [x] Completar módulo `compute` (probes → `/health` tras hallazgo de GFE, VPC connector → `/28` tras hallazgo de netmask, certificado SSL + proxy HTTPS + forwarding rule, Artifact Registry, binding IAM público)
+- [x] Completar módulo `iam` (roles mínimos del SA de CI/CD: `run.developer`, `iam.serviceAccountUser`, `artifactregistry.writer`+`reader`)
+- [x] `terraform apply` completo a staging — 38/38 recursos totales aplicados (múltiples hallazgos resueltos: API `vpcaccess` faltante, connector residual en ERROR, lock de estado huérfano tras corte de sesión, import del connector, IAM vacío, endpoint `/healthz` interceptado por GFE)
+- [x] Verificar recursos en consola GCP — Cloud Run público y funcional (`curl /health` → 200 OK)
+- [ ] Segundo `terraform plan` → confirmar "No changes" (pendiente de re-verificar tras los últimos cambios de esta sesión)
 
-### Fase 3 — Docker + primer despliegue manual
+### Fase 3 — Docker + primer despliegue manual (adelantada parcialmente durante la Fase 2)
 
-- [ ] Completar `Dockerfile` (labels OCI reales, SHA de git real)
-- [ ] Build local de la imagen
-- [ ] Push manual a Artifact Registry → obtener primer `image_sha` real
-- [ ] Verificar `docker run` local + healthcheck
+- [x] Completar `Dockerfile` (labels OCI reales con `ARG GIT_SHA`/`BUILD_DATE`, endpoint `/health`)
+- [x] Build local de la imagen (placeholder mínimo `server.js`, NO es la app OMS real — ver nota en el propio código)
+- [x] Push manual a Artifact Registry → `image_sha` real obtenido: `sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25`
+- [x] Verificar `docker run` local + healthcheck (probado antes del push)
+- [ ] Desplegar esta imagen corregida a Cloud Run vía Ansible (pendiente, es la Fase 4 — recordar que Terraform ignora cambios de imagen deliberadamente)
 
 ### Fase 4 — Ansible: staging
 
@@ -121,6 +122,15 @@ _(vacío por ahora — se va llenando conforme avancemos)_
 | 2026-09-20 | Fase 0 | `gcloud` no detectado en la sesión de Bash tras instalar el SDK (problema de PATH) | `export PATH=...` + persistido en `~/.bashrc`, sin reiniciar VS Code | BITACORA-COMANDOS.md § 0.5 |
 | 2026-09-20 | Fase 0 | Docker Desktop no arrancaba: "WSL integration with distro 'Ubuntu' unexpectedly stopped" tras actualización de Windows | `wsl --shutdown` + reabrir Docker Desktop | BITACORA-COMANDOS.md § 0.5b |
 | 2026-09-20 | Fase 0 | `gcloud auth application-default login --no-launch-browser`: primero `Scope has changed` (consentimiento incompleto), luego `Error 400: Missing required parameter: redirect_uri` al usar mal el modo `--remote-bootstrap` | Usar el flujo normal sin `--no-browser` (WSL2 reenvía `localhost:8085` automáticamente al navegador de Windows) | BITACORA-COMANDOS.md § 0.6 |
+| 2026-09-21 | Fase 1 | `terraform apply` falló: `SERVICE_NETWORKING_NOT_ENABLED` | Faltaba habilitar `servicenetworking.googleapis.com` en la Fase 0 — corregido en ambos proyectos | BITACORA-COMANDOS.md § 1.4 |
+| 2026-09-21 | Fase 1 | Condición de carrera: Cloud SQL/Redis se creaban en paralelo con la conexión de peering, sin dependencia declarada | `depends_on` explícito entre módulos (nuevo output `private_vpc_connection_id`) | BITACORA-COMANDOS.md § 1.4 |
+| 2026-09-21 | Fase 2 | `terraform apply` falló: `Serverless VPC Access API has not been used` | Faltaba habilitar `vpcaccess.googleapis.com` — corregido en ambos proyectos | BITACORA-COMANDOS.md § 2.5 |
+| 2026-09-21 | Fase 2 | VPC Connector rechazado: "Subnets used for VPC connectors must have a netmask of 28" | Subred `connector` redimensionada de `/20` a `/28` (caso real de VLSM) | BITACORA-COMANDOS.md § 2.5 |
+| 2026-09-21 | Fase 2 | Corte de sesión a media ejecución dejó un connector residual en GCP y un lock de estado huérfano | Eliminación manual del residual + `terraform force-unlock` + `terraform import` del connector real | BITACORA-COMANDOS.md § 2.5 |
+| 2026-09-21 | Fase 2 | Artifact Registry creado inicialmente a mano (fuera de Terraform) — **señalado correctamente por el usuario** | Revertido y declarado como `google_artifact_registry_repository` en Terraform | BITACORA-COMANDOS.md § 2.6 |
+| 2026-09-21 | Fase 3 | `docker push` fallaba: helper `docker-credential-gcloud` es un `.cmd` de Windows, incompatible con Docker en WSL | Instalado `docker-credential-gcr` (binario nativo de Linux, sin `sudo`) | BITACORA-COMANDOS.md § 3.1 |
+| 2026-09-21 | Fase 2 | Cloud Run con política IAM vacía → 403/404 en toda ruta | `roles/run.invoker` para `allUsers` vía Terraform | BITACORA-COMANDOS.md § 3.3 |
+| 2026-09-21 | Fase 2 | `/healthz` siempre 404 (nunca en logs) aunque `/` funcionaba — Google Front End intercepta esa ruta antes de Cloud Run | Renombrado el endpoint a `/health` en todo el proyecto | BITACORA-COMANDOS.md § 3.3 |
 
 ---
 

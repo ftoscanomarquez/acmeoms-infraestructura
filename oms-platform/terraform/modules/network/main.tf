@@ -44,20 +44,29 @@ resource "google_compute_subnetwork" "private" {
 }
 
 # ─── Subred para el VPC Access Connector (Cloud Run → Redis privado) ──
-# Mismo tamaño que `private` (/20) por simplicidad, aunque un connector
-# real solo necesita un puñado de IPs — se prioriza consistencia sobre
-# optimizar el espacio de direcciones (que aquí sobra de todos modos:
-# el /16 completo tiene 65.536 IPs, y solo usamos 2 × 4.096 = 8.192).
 #
-# El índice "1" (en vez de "0", que ya usa `private`) es lo que garantiza
-# que este bloque NO se solape con el anterior: cidrsubnet(vpc_cidr, 4, N)
-# corta el /16 en 16 franjas iguales de /20, y cada índice N (0 a 15)
-# selecciona una franja distinta y disjunta de las demás. Índice 1 da
-# 10.20.16.0/20 — justo la franja siguiente a la que ya ocupa `private`
-# (10.20.0.0/20), sin ningún hueco ni superposición entre ambas.
+# CORRECCIÓN REAL (hallazgo durante el apply de la Fase 2 — ver
+# BITACORA-COMANDOS.md): originalmente esta subred usaba el mismo tamaño
+# /20 que `private`, "por simplicidad". Al intentar crear el
+# google_vpc_access_connector sobre ella, GCP rechazó la operación con:
+# "Subnets used for VPC connectors must have a netmask of 28." — es un
+# requisito TÉCNICO DURO y específico de este tipo de recurso (no
+# negociable, no configurable), no una elección de diseño. Es el caso de
+# uso real de VLSM (máscara de tamaño variable) que se discutió en la
+# teoría de la Fase 1: aquí SÍ hace falta un tamaño distinto y más chico
+# que el resto de subredes de esta VPC.
+#
+# Se recorta un /28 (16 IPs, de las cuales GCP usa un puñado para el
+# propio connector) DENTRO del espacio ya reservado para "connector"
+# (10.20.16.0/20), anidando cidrsubnet: primero se toma el mismo /20 de
+# antes como "contenedor", y ENCIMA de ese contenedor se recorta el /28
+# final en el índice 0 (el primer subbloque de 16 IPs de ese /20).
 resource "google_compute_subnetwork" "connector" {
-  name                     = "oms-${var.env}-connector"
-  ip_cidr_range            = cidrsubnet(var.vpc_cidr, 4, 1)  # /20 del /16 → 10.20.16.0/20
+  name = "oms-${var.env}-connector"
+  ip_cidr_range = cidrsubnet(
+    cidrsubnet(var.vpc_cidr, 4, 1),  # 10.20.16.0/20 (el mismo "carril" reservado antes)
+    8, 0                              # + 8 bits: /20 → /28 (20+8=28) → 10.20.16.0/28
+  )
   region                   = var.region
   network                  = google_compute_network.main.id
   private_ip_google_access = true
@@ -212,8 +221,13 @@ output "network_self_link"   { value = google_compute_network.main.self_link }
 output "private_subnet_id"   { value = google_compute_subnetwork.private.id }
 output "private_subnet_cidr" { value = google_compute_subnetwork.private.ip_cidr_range }
 # Agregado por el equipo: la Fase 2 (módulo compute) necesita esta subred
-# para crear el VPC Access Connector de Cloud Run.
+# para crear el VPC Access Connector de Cloud Run. Se exponen tanto `.id`
+# (ruta completa) como `.name` (nombre corto) porque distintos recursos de
+# GCP consumidores exigen formatos distintos — hallazgo real detectado al
+# aplicar google_vpc_access_connector, que exige específicamente el
+# nombre corto en su campo subnet.name (ver módulo compute).
 output "connector_subnet_id"   { value = google_compute_subnetwork.connector.id }
+output "connector_subnet_name" { value = google_compute_subnetwork.connector.name }
 output "connector_subnet_cidr" { value = google_compute_subnetwork.connector.ip_cidr_range }
 
 # Agregado por el equipo (hallazgo de la Fase 1, ver BITACORA-COMANDOS.md):

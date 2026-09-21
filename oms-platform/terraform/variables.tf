@@ -99,5 +99,8 @@ variable "github_repository" {
 variable "lb_domain" {
   type        = string
   description = "Dominio para el certificado SSL managed del Load Balancer (requiere DNS real apuntando a la IP del LB)."
-  default     = "PENDIENTE-DOMINIO-REAL.example.com"
+  # En minúsculas: GCP normaliza el campo `domains` del certificado a
+  # minúsculas al crearlo — con mayúsculas, Terraform detecta diferencia
+  # permanente y fuerza destruir/recrear el certificado en cada apply.
+  default = "pendiente-dominio-real.example.com"
 }

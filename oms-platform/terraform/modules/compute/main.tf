@@ -15,8 +15,13 @@ variable "redis_host"              { type = string }
 variable "labels"                  { type = map(string) }
 # Agregado por el equipo: subred dedicada (preparada en el módulo network,
 # Fase 1) para el VPC Access Connector que permite a Cloud Run alcanzar
-# Memorystore Redis por IP privada.
+# Memorystore Redis por IP privada. Se necesitan DOS formas del mismo
+# recurso porque distintos campos de GCP esperan formatos distintos:
+# `connector_subnet_id` (ruta completa, sin uso actual pero se deja
+# disponible para otros posibles usos futuros) y `connector_subnet_name`
+# (nombre corto, el que realmente exige `google_vpc_access_connector`).
 variable "connector_subnet_id"     { type = string }
+variable "connector_subnet_name"   { type = string }
 # Agregado por el equipo: dominio para el certificado SSL managed del Load
 # Balancer. DECISIÓN DOCUMENTADA (ver BITACORA-COMANDOS.md Fase 2): un
 # dominio real es un recurso que se compra por separado a un registrador
@@ -29,7 +34,32 @@ variable "connector_subnet_id"     { type = string }
 # con HTTPS ya válido (output cloud_run_url) mientras tanto.
 variable "lb_domain" {
   type    = string
-  default = "PENDIENTE-DOMINIO-REAL.example.com"
+  # En minúsculas a propósito: GCP normaliza automáticamente el campo
+  # `domains` de un certificado managed a minúsculas al crearlo. Si aquí se
+  # escribe con mayúsculas, Terraform detecta una diferencia permanente
+  # entre "lo que pedimos" y "lo que GCP realmente guardó", y como ese
+  # campo es inmutable, fuerza destruir y recrear el certificado en CADA
+  # apply (visto en la práctica durante la Fase 2 de este proyecto).
+  default = "pendiente-dominio-real.example.com"
+}
+
+# ─── Repositorio de Artifact Registry (imágenes Docker del OMS) ───
+# NOTA DE DISEÑO (agregado por el equipo, corrección de un hallazgo real
+# durante la Fase 2/3): este repositorio se había creado inicialmente a
+# mano vía `gcloud artifacts repositories create`, fuera de Terraform. Eso
+# es incorrecto por dos razones: (1) Terraform nunca lo conocería, así que
+# un futuro `terraform destroy` lo dejaría huérfano, generando coste
+# indefinidamente sin que el proyecto lo controle; (2) rompe la
+# reproducibilidad — recrear el proyecto desde cero requeriría acordarse
+# de este paso manual aparte, contradiciendo el principio de
+# Infraestructura como Código que exige el enunciado. Se revirtió el
+# recurso creado a mano y se define aquí correctamente.
+resource "google_artifact_registry_repository" "oms" {
+  location      = var.region
+  repository_id = "oms"
+  format        = "DOCKER"
+  description   = "Repositorio de imágenes Docker del OMS (AcmeOMS)."
+  labels        = var.labels
 }
 
 # ─── Service Account dedicada al runtime ──────────────────────────
@@ -52,7 +82,14 @@ resource "google_vpc_access_connector" "redis" {
   name    = "oms-${var.env}-connector"
   region  = var.region
   subnet {
-    name = var.connector_subnet_id
+    # NOTA DE DISEÑO (hallazgo real durante el apply de la Fase 2): el
+    # campo `subnet.name` de este recurso espera el NOMBRE CORTO de la
+    # subred (ej. "oms-staging-connector"), no la ruta completa que
+    # devuelve el atributo `.id` de una subred (algo como
+    # ".../regions/europe-west3/subnetworks/oms-staging-connector").
+    # Es una inconsistencia real entre recursos de GCP: unos esperan `.id`
+    # completo, otros solo `.name` corto — aquí hay que usar `.name`.
+    name = var.connector_subnet_name
   }
   # Rango de instancias del connector: mínimo 2 (alta disponibilidad básica
   # del propio connector), máximo 3 — tráfico esperado bajo (solo llamadas
@@ -122,10 +159,21 @@ resource "google_cloud_run_v2_service" "oms" {
       }
 
       # NOTA DE DISEÑO (agregado por el equipo): dos sondas con propósitos
-      # distintos, ambas contra /healthz (el mismo endpoint que ya usa el
+      # distintos, ambas contra /health (el mismo endpoint que ya usa el
       # HEALTHCHECK nativo de Docker en el Dockerfile — Cloud Run no lee ese
       # HEALTHCHECK de Docker, tiene su propio mecanismo, por eso hace falta
       # declararlo aquí también).
+      #
+      # CORRECCIÓN REAL (hallazgo durante el primer despliegue, Fase 2): el
+      # endpoint originalmente se llamaba /healthz. Aunque estas probes
+      # INTERNAS de Cloud Run sí pasaron correctamente contra /healthz (el
+      # servicio llegó a status.conditions Ready=True), el tráfico PÚBLICO
+      # externo a esa misma ruta era interceptado por Google Front End
+      # (GFE) antes de llegar al contenedor, devolviendo un 404 genérico de
+      # Google sin que la petición apareciera nunca en los logs de Cloud
+      # Run. Se estandarizó a /health en todo el proyecto (server.js,
+      # Dockerfile, y aquí) para evitar cualquier ambigüedad entre el
+      # comportamiento de las probes internas y el del tráfico público real.
       #
       # startup_probe: se ejecuta SOLO al arrancar un contenedor nuevo (cada
       # revisión nueva, cada instancia nueva al escalar). Mientras no pase,
@@ -133,7 +181,7 @@ resource "google_cloud_run_v2_service" "oms" {
       # peticiones de usuarios a un contenedor que aún está inicializando.
       startup_probe {
         http_get {
-          path = "/healthz"
+          path = "/health"
           port = 8080
         }
         initial_delay_seconds = 5    # tiempo antes del primer intento
@@ -150,7 +198,7 @@ resource "google_cloud_run_v2_service" "oms" {
       # humana inmediata").
       liveness_probe {
         http_get {
-          path = "/healthz"
+          path = "/health"
           port = 8080
         }
         period_seconds    = 10
@@ -191,6 +239,29 @@ resource "google_cloud_run_v2_service" "oms" {
       template[0].containers[0].image,
     ]
   }
+}
+
+# ─── Permiso de invocación pública ─────────────────────────────────
+# NOTA DE DISEÑO (agregado por el equipo, hallazgo real tras el primer
+# despliegue): por defecto, Cloud Run NO permite invocar el servicio sin
+# autenticación — la política IAM nace vacía (`gcloud run services
+# get-iam-policy` devolvía sin ningún binding). Al probar la URL nativa de
+# Cloud Run, esto se manifestó como 403/404 devueltos por la capa de Google
+# Front End (IAM), ANTES de que la petición llegara al contenedor — el
+# servicio en sí ya estaba sano (`status.conditions: Ready = True`).
+#
+# Se otorga `roles/run.invoker` a `allUsers` porque este es un servicio
+# HTTP público destinado a recibir tráfico de clientes finales a través del
+# Load Balancer (arquitectura objetivo del enunciado) — no es un servicio
+# interno. El acceso real de los usuarios finales sigue pasando por HTTPS
+# vía el Load Balancer; este binding solo habilita que Cloud Run ACEPTE
+# esas peticiones en lugar de rechazarlas por falta de autenticación.
+resource "google_cloud_run_v2_service_iam_member" "public_invoker" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.oms.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
 }
 
 # ─── HTTPS Load Balancer + Cloud CDN ──────────────────────────────
@@ -292,3 +363,8 @@ resource "google_compute_global_forwarding_rule" "https" {
 output "cloud_run_url"             { value = google_cloud_run_v2_service.oms.uri }
 output "cloud_run_service_account" { value = google_service_account.cloud_run.email }
 output "load_balancer_ip"          { value = google_compute_global_address.lb_ip.address }
+# Agregado por el equipo: URL completa del repositorio de Artifact Registry,
+# útil para el pipeline de CI/CD (Fase 6) al hacer `docker push`.
+output "artifact_registry_url" {
+  value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.oms.repository_id}"
+}

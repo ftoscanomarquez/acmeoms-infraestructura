@@ -1,10 +1,14 @@
 # ── Dockerfile del OMS ────────────────────────────────────────────
 # Multi-stage. Cumple la spec del Vídeo 1:
 #   ✓ usuario no-root (UID > 10000)
-#   ✓ HEALTHCHECK contra /healthz
+#   ✓ HEALTHCHECK contra /health
 #   ✓ Labels OCI con trazabilidad
 #   ✓ Tamaño minimizado (slim runtime)
 #   ✓ Cero secretos en capas
+#
+# NOTA: el endpoint es /health, NO /healthz — ver server.js para el
+# hallazgo real (GFE intercepta /healthz antes de llegar al contenedor
+# en Cloud Run).
 #
 # Estamos asumiendo Node.js como ejemplo. Si el OMS está en Python o Java,
 # adapta las imágenes base pero MANTÉN la estructura multi-stage.
@@ -17,7 +21,14 @@ WORKDIR /app
 
 # Aprovechar cache: solo invalidar pip install si requirements cambia
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# NOTA DE DISEÑO (agregado por el equipo): el placeholder actual (server.js,
+# solo módulos nativos de Node) no tiene NINGUNA dependencia de terceros —
+# "npm ci" con un package.json sin `dependencies` no crea node_modules en
+# absoluto (no hay nada que instalar). Se crea el directorio explícitamente
+# para que el `COPY --from=deps` de la etapa de runtime nunca falle por
+# "file does not exist", sea cual sea el estado de las dependencias reales
+# que la aplicación OMS termine necesitando en el futuro.
+RUN npm ci --omit=dev && mkdir -p node_modules
 
 # ─── Etapa 2: runtime ─────────────────────────────────────────────
 FROM node:22-alpine
@@ -42,12 +53,23 @@ EXPOSE 8080
 
 # Healthcheck para Cloud Run (también lo usa el HTTPS LB en su health check)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+  CMD wget -qO- http://127.0.0.1:8080/health || exit 1
 
-# TODO(alumno): añade más labels OCI si quieres (created, vendor, title, description)
-LABEL org.opencontainers.image.source="https://github.com/TODO-org/oms" \
+# NOTA DE DISEÑO (agregado por el equipo): labels OCI completos para
+# trazabilidad. `revision` se pasa como ARG en el momento del build (no
+# hardcodeado) porque cambia en cada commit — ver comando de build en
+# BITACORA-COMANDOS.md Fase 3. `created` también se inyecta en build-time
+# (la fecha de build, no la de escritura de este Dockerfile).
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/ftoscanomarquez/acmeoms-infraestructura" \
       org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.revision="TODO_GIT_SHA" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.vendor="AcmeOMS" \
+      org.opencontainers.image.title="oms-platform" \
+      org.opencontainers.image.description="AcmeOMS — infraestructura del monolito modular OMS (ver anexo-arquitectura/03-arquitectura.md). Esta imagen, mientras no exista la app real, corre un placeholder minimo (server.js) unicamente para fines de despliegue de infraestructura."
 
 CMD ["node", "server.js"]

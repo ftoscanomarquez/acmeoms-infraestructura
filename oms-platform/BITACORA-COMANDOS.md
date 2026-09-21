@@ -1198,4 +1198,512 @@ Changes to Outputs:
 
 **Siguiente paso:** `terraform apply` completo contra staging.
 
-**Estado:** ✅ verificación por API hecha — 2026-09-21. Verificación visual en consola: pendiente de confirmación del usuario.
+---
+
+### 2.5 · `terraform apply` completo contra staging — 1er intento falla (misma clase de hallazgo que la Fase 1)
+
+**Comando ejecutado:**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -auto-approve
+```
+
+**Resultado — falló parcialmente, 11/20 recursos creados exitosamente:** todo el módulo `iam` completo (pool WIF, provider, SA de CI/CD, binding, los 4 roles del SA de CI/CD, los 2 roles del SA de runtime) + el SA de runtime del módulo `compute` + la IP del Load Balancer + el certificado SSL (en `PROVISIONING`, como se esperaba). El error:
+
+```
+Error: Error creating Connector: googleapi: Error 403: Serverless VPC Access API has not been
+used in project acmeoms-staging-fatm before or it is disabled.
+  with module.compute.google_vpc_access_connector.redis
+```
+
+**Diagnóstico:** misma clase de hallazgo que en la Fase 1 (§ 1.5) — **`vpcaccess.googleapis.com`** (Serverless VPC Access API) sustenta específicamente el recurso `google_vpc_access_connector` (resuelto en el TODO#2 de `compute`), y no estaba en la lista original de 7 APIs de la Fase 0 ni se agregó después. El fallo bloqueó en cascada al resto de recursos que dependían de él (Cloud Run, NEG, backend service, url map, target https proxy, forwarding rule — 8 recursos que ni siquiera llegaron a intentarse en esta ejecución).
+
+**Lección consolidada (ya van 2 veces con el mismo patrón):** cada vez que un módulo de Terraform introduce un tipo de recurso nuevo, conviene revisar explícitamente en la documentación de ese recurso (`google_vpc_access_connector`, `google_service_networking_connection`, etc.) cuál API de GCP lo sustenta, en vez de confiar solo en la lista de APIs ya habilitada — algunas APIs de soporte no tienen un nombre obvio que coincida con el nombre del recurso de Terraform.
+
+**Corrección aplicada:**
+
+```bash
+gcloud services enable vpcaccess.googleapis.com --project=acmeoms-staging-fatm
+gcloud services enable vpcaccess.googleapis.com --project=acmeoms-production-fatm
+```
+
+**Reintento 1 — mismo error + hallazgo adicional del certificado:**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -auto-approve
+```
+
+**Resultado:** el error de `vpcaccess.googleapis.com` **persistió**, idéntico al primer intento, a pesar de haber habilitado la API un par de minutos antes. El propio mensaje de Google lo advierte explícitamente: *"If you enabled this API recently, wait a few minutes for the action to propagate to our systems and retry"* — la habilitación de una API no es instantánea en todos los sistemas internos de GCP; 1-2 minutos no fueron suficientes.
+
+**Hallazgo adicional (menor, no bloqueante) detectado en el mismo plan:** el certificado SSL managed apareció marcado `must be replaced`:
+
+```
+~ domains = [ # forces replacement
+    ~ "pendiente-dominio-real.example.com" -> "PENDIENTE-DOMINIO-REAL.example.com",
+  ]
+```
+
+**Causa:** GCP normaliza automáticamente el campo `domains` de un certificado managed a minúsculas al crearlo (guardó `pendiente-dominio-real.example.com` en el primer `apply`), pero el código seguía enviando el placeholder con mayúsculas (`PENDIENTE-DOMINIO-REAL.example.com`). Como ese campo es inmutable, Terraform detecta la diferencia permanente entre lo pedido y lo real, y fuerza destruir+recrear el certificado — esto se repetiría en CADA `apply` futuro si no se corrige. El certificado sí se destruyó y recreó exitosamente en este intento (`Creation complete after 12s`), antes de que fallara el connector.
+
+**Corrección aplicada:** placeholder cambiado a minúsculas desde el origen, en ambos lugares donde se declara (`modules/compute/main.tf` y `variables.tf` de la raíz):
+
+```hcl
+default = "pendiente-dominio-real.example.com"  # antes: PENDIENTE-DOMINIO-REAL.example.com
+```
+
+**Reintento 2:** se decidió dar más margen de propagación a la API antes de reintentar (3 minutos vía `ScheduleWakeup`, en vez de reintentar inmediatamente).
+
+**Resultado — la propagación de la API sí funcionó, pero apareció un error NUEVO y distinto:**
+
+```
+Plan: 7 to add, 0 to change, 0 to destroy.   ← ya no 8 con reemplazo: el fix de minúsculas del certificado funcionó
+...
+Error: Error creating Connector: googleapi: Error 400: Please provide a properly formatted subnet name.
+  with module.compute.google_vpc_access_connector.redis
+```
+
+El error 403 de "API disabled" ya NO apareció — confirma que el margen de espera sí era lo que faltaba para ese problema. Pero surgió uno nuevo, de formato.
+
+**Diagnóstico:** `connector_subnet_id` (el output del módulo `network` que se estaba pasando a `subnet.name`) usa el atributo `.id` de la subred, que devuelve la RUTA COMPLETA (`projects/acmeoms-staging-fatm/regions/europe-west3/subnetworks/oms-staging-connector`). Pero el campo `subnet.name` de `google_vpc_access_connector` espera específicamente el NOMBRE CORTO (`oms-staging-connector`), no la ruta completa — es una inconsistencia real entre recursos de GCP: unos consumidores esperan `.id` (ruta completa), otros esperan `.name` (nombre corto), y no hay una regla universal, hay que revisar la documentación de cada recurso.
+
+**Corrección aplicada:**
+
+1. Nuevo output en `modules/network/main.tf`: `connector_subnet_name` (usa `.name` en vez de `.id`), además de mantener `connector_subnet_id` ya existente (para otros posibles usos futuros que sí necesiten la ruta completa).
+2. Nueva variable en `modules/compute/main.tf`: `connector_subnet_name`, usada específicamente en `subnet { name = var.connector_subnet_name }`.
+3. Conectado en `terraform/main.tf`: `connector_subnet_name = module.network.connector_subnet_name`.
+
+**Validación tras el fix:** `terraform validate` → `Success! The configuration is valid.`
+
+**Reintento 3 — nuevo hallazgo, esta vez sobre el TAMAÑO de la subred:**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -auto-approve
+```
+
+**Resultado:** el nombre corto ya fue aceptado (`name = "oms-staging-connector"`), y el intento avanzó considerablemente más (2m20s intentando crear el recurso) antes de fallar con un error nuevo:
+
+```
+Error: Error waiting to create Connector: Error waiting for Creating Connector: Error code 3,
+message: Operation failed: Subnets used for VPC connectors must have a netmask of 28.
+  with module.compute.google_vpc_access_connector.redis
+```
+
+**Diagnóstico:** este es un **requisito técnico duro y no negociable de GCP** para este tipo específico de recurso — cualquier subred usada por un VPC Access Connector debe medir EXACTAMENTE `/28` (16 IPs), ni más grande ni más chica. La subred `connector` se había diseñado en la Fase 1 con el mismo tamaño `/20` que `private` "por simplicidad" (decisión documentada en su momento, § Fase 1 1.1) — sin saber en ese momento que el connector tenía este requisito rígido. Es, retrospectivamente, el caso de uso real de VLSM (máscara de tamaño variable) que se discutió en la teoría de la Fase 1: aquí sí hacía falta un tamaño distinto y más chico que el resto de subredes.
+
+**Corrección aplicada en `modules/network/main.tf`:** se redimensionó la subred `connector` de `/20` a `/28`, recortándola con `cidrsubnet` anidado — primero se toma el mismo `/20` reservado antes como "contenedor" (`cidrsubnet(var.vpc_cidr, 4, 1)` → `10.20.16.0/20`), y encima de ese contenedor se recorta el `/28` final (`cidrsubnet(..., 8, 0)` → `10.20.16.0/28`, sumando 8 bits: 20+8=28):
+
+```hcl
+resource "google_compute_subnetwork" "connector" {
+  name = "oms-${var.env}-connector"
+  ip_cidr_range = cidrsubnet(
+    cidrsubnet(var.vpc_cidr, 4, 1),  # 10.20.16.0/20 (mismo "carril" reservado antes)
+    8, 0                              # + 8 bits: /20 → /28 → 10.20.16.0/28
+  )
+  region                   = var.region
+  network                  = google_compute_network.main.id
+  private_ip_google_access = true
+}
+```
+
+**Verificación del cálculo con `terraform console`** (en vez de confiar solo en la aritmética a mano):
+
+```bash
+terraform console <<< 'cidrsubnet(cidrsubnet("10.20.0.0/16", 4, 1), 8, 0)'
+# → "10.20.16.0/28"
+```
+
+Confirmado correcto. También se agregó el output `connector_subnet_name` (nombre corto) junto al ya existente `connector_subnet_id` (ruta completa), y se conectó en `modules/compute/main.tf` (nueva variable `connector_subnet_name`, usada en `subnet { name = ... }`) y en `terraform/main.tf`.
+
+**Efecto colateral esperado:** como la subred `connector` ya existía en GCP como `/20` (creada exitosamente en la Fase 1), cambiar su `ip_cidr_range` fuerza que Terraform la destruya y recree — seguro en este punto porque ningún recurso real llegó a depender de ella todavía (el connector nunca se creó con éxito en los 3 intentos anteriores).
+
+**Reintento 4 — hallazgo de estado inconsistente entre Terraform y GCP:**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -auto-approve
+```
+
+Plan confirmado correcto (`8 to add, 0 to change, 1 to destroy` — la subred `connector` vieja `/20` a reemplazar por la `/28`). Pero al intentar destruir la subred vieja:
+
+```
+Error: Error when reading or editing Subnetwork: googleapi: Error 400: The subnetwork resource
+'.../subnetworks/oms-staging-connector' is already being used by
+'projects/acmeoms-staging-fatm/zones/europe-west3-c/instances/aet-europewest3-oms--staging--connector-7zxp',
+resourceInUseByAnotherResource
+```
+
+**Diagnóstico — estado inconsistente entre Terraform y la realidad de GCP:** en el Reintento 3 (el que falló por "netmask must be 28"), Terraform reportó que `google_vpc_access_connector` había fallado — pero GCP, internamente, YA había empezado a crear la infraestructura física del conector (una VM interna visible como `aet-europewest3-oms--staging--connector-7zxp`) antes de descubrir el problema de tamaño y abortar la operación. Como la operación general falló, ese conector nunca quedó registrado en el `tfstate` de Terraform — Terraform "no sabe" que existe — pero GCP sí dejó un recurso físico a medio crear, que ahora bloquea el borrado de la subred vieja que necesitamos reemplazar.
+
+**Verificación y corrección — limpieza manual del recurso huérfano (fuera de Terraform, vía `gcloud` directo):**
+
+```bash
+# Confirmar que el conector residual existe y en qué estado
+gcloud compute networks vpc-access connectors list --region=europe-west3 --project=acmeoms-staging-fatm
+# → CONNECTOR_ID: oms-staging-connector, STATE: ERROR
+
+# Eliminarlo directamente (Terraform no lo conoce, no se puede hacer vía terraform destroy)
+gcloud compute networks vpc-access connectors delete oms-staging-connector \
+  --region=europe-west3 --project=acmeoms-staging-fatm --quiet
+```
+
+**Lección:** cuando un `apply` de Terraform falla a media creación de un recurso, es posible que el proveedor cloud (GCP) haya dejado infraestructura física parcial que Terraform no llegó a registrar en su estado. Antes de simplemente "cambiar el código y reintentar", conviene verificar con la CLI nativa del proveedor (`gcloud list`) si quedó algo huérfano que además pueda bloquear el siguiente intento.
+
+**Reintento 5 — la sesión de Claude Code se cortó a media ejecución, dejando el estado bloqueado:**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -auto-approve
+```
+
+**Resultado:** el plan volvió a mostrar `8 to add, 0 to change, 1 to destroy` (mismo plan que el intento anterior, correcto). La subred `connector` se destruyó y recreó exitosamente como `/28` (`Destruction complete after 34s`, `Creation complete after 35s`), y el `google_vpc_access_connector.redis` empezó a crearse — pero a los 2m20s, **la sesión de Claude Code se cortó** (proceso terminado externamente, marcado como `[killed]` en el log), dejando el `apply` sin completarse ni fallar de forma "limpia".
+
+**Verificación tras retomar la sesión — nunca asumir el resultado de un proceso interrumpido:**
+
+```bash
+gcloud compute networks vpc-access connectors list --region=europe-west3 --project=acmeoms-staging-fatm
+# → CONNECTOR_ID: oms-staging-connector, STATE: READY
+```
+
+Buena noticia: el connector **sí terminó de crearse correctamente en GCP** (estado `READY`, no `ERROR`) — la operación había avanzado lo suficiente en el proveedor cloud antes del corte. Pero como Terraform nunca recibió esa confirmación, es probable que su `tfstate` no lo supiera.
+
+**Segundo problema encontrado al intentar diagnosticar con `terraform plan`:**
+
+```
+Error: Error acquiring the state lock
+Error message: writing "gs://acmeoms-staging-fatm-tfstate/oms-platform/staging/default.tflock" failed:
+googleapi: Error 412: At least one of the pre-conditions you specified did not hold., conditionNotMet
+Lock Info: ID: 1789971985805513, Operation: OperationTypeApply, Who: franc@HUAWEI-MELI
+```
+
+**Diagnóstico:** el `apply` interrumpido nunca llegó a liberar el "candado" (lock) que Terraform coloca sobre el estado remoto para evitar que dos operaciones lo modifiquen a la vez (mecanismo de protección del backend `gcs` configurado en la Fase 1). Al morir el proceso de golpe (corte de sesión), ese lock quedó huérfano indefinidamente.
+
+**Corrección aplicada — liberación manual del lock** (segura porque ya se confirmó que no hay ninguna operación real en curso, el proceso que lo generó ya no existe):
+
+```bash
+terraform force-unlock -force 1789971985805513
+# → Terraform state has been successfully unlocked!
+```
+
+**Lección clave — dos aprendizajes de este incidente:**
+1. **Nunca asumir el resultado de un proceso interrumpido** — hay que verificar contra la API real del proveedor (aquí, `gcloud list`) antes de decidir el siguiente paso, tal como se hizo también en el hallazgo del conector huérfano anterior.
+2. **Un corte de sesión a media escritura del estado remoto puede dejar el lock bloqueado** — `terraform force-unlock` es la herramienta correcta para resolverlo, pero solo debe usarse tras confirmar que no hay una operación real en curso desde otro proceso/persona.
+
+**Siguiente paso:** `terraform plan` (ya con el lock liberado) para confirmar el estado real y decidir si hace falta un `terraform import` del connector o si el próximo `apply` simplemente lo detecta correctamente.
+
+**Resultado del plan tras liberar el lock:** `Plan: 7 to add, 0 to change, 0 to destroy` — ya no aparece "1 to destroy" (la subred `/28` quedó correctamente reconocida), pero `google_vpc_access_connector.redis` sigue apareciendo como `will be created`, porque Terraform no lo tiene en su estado (aunque exista físicamente en GCP con estado `READY`). Un `apply` directo en este punto fallaría con "recurso duplicado" al intentar crear algo que ya existe.
+
+**Solución: `terraform import`** — registra un recurso real ya existente en el estado de Terraform, sin volver a crearlo.
+
+**Primer intento — falló por olvido de `-var-file`:**
+
+```bash
+terraform import 'module.compute.google_vpc_access_connector.redis' \
+  'projects/acmeoms-staging-fatm/locations/europe-west3/connectors/oms-staging-connector'
+```
+
+Al faltar `-var-file=envs/staging.tfvars`, Terraform intentó pedir cada variable de forma interactiva (`Enter a value:`) — como el comando se ejecuta sin una terminal interactiva real, el input se agotó y terminó fallando con "No value for required variable" para cada variable sin default.
+
+**Segundo intento — exitoso:**
+
+```bash
+terraform import -var-file=envs/staging.tfvars 'module.compute.google_vpc_access_connector.redis' \
+  'projects/acmeoms-staging-fatm/locations/europe-west3/connectors/oms-staging-connector'
+```
+
+Resultado:
+```
+Import successful!
+The resources that were imported are shown above. These resources are now in
+your Terraform state and will henceforth be managed by Terraform.
+```
+
+**Formato del ID de import usado:** `projects/{project}/locations/{region}/connectors/{name}` — el formato específico que exige el recurso `google_vpc_access_connector` (cada tipo de recurso de Terraform define su propio formato de ID de import; se encuentra en la documentación del provider).
+
+**Verificación final — `terraform plan` tras el import:**
+
+```
+Plan: 6 to add, 0 to change, 0 to destroy.
+```
+
+El connector ya NO aparece en el plan (reconocido correctamente, sin diferencias), y `vpc_access.connector` en el recurso Cloud Run ya referencia su ID real (`projects/acmeoms-staging-fatm/locations/europe-west3/connectors/oms-staging-connector`) en vez de `(known after apply)`. Solo quedan los 6 recursos que genuinamente no existen todavía: `google_cloud_run_v2_service.oms`, `google_compute_backend_service.default`, `google_compute_global_forwarding_rule.https`, `google_compute_region_network_endpoint_group.cloud_run_neg`, `google_compute_target_https_proxy.default`, `google_compute_url_map.default`.
+
+**Resumen del incidente completo del connector (Reintentos 3-5 + import):** un solo hallazgo original (tamaño de subred incorrecto) se combinó con un corte de sesión a media ejecución, generando una cadena de 3 problemas resueltos en secuencia: (1) redimensionar la subred a `/28`, (2) limpiar un connector residual en estado ERROR de un intento anterior, (3) recuperar un lock de estado huérfano tras el corte de sesión, (4) importar al estado un connector que sí se había creado correctamente en GCP pero que Terraform no llegó a registrar. Ilustra bien por qué verificar contra la API real del proveedor (nunca asumir el resultado de un proceso interrumpido) es una disciplina necesaria al trabajar con infraestructura real.
+
+**`terraform apply` final — bloqueado por el placeholder de `image_sha`:**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -auto-approve
+```
+
+Resultado: `Plan: 6 to add` confirmado, pero falló de inmediato al crear Cloud Run:
+
+```
+Error: Error creating Service: googleapi: Error 400: Violation in CreateServiceRequest.service.template.containers[0].image:
+must be a container image path in the form [hostname/]repo-path[:tag and/or @digest]
+  with module.compute.google_cloud_run_v2_service.oms
+```
+
+**Diagnóstico (esperado, no un hallazgo nuevo):** el placeholder `sha256:0000...PENDIENTE_FASE_3` de `envs/staging.tfvars` no es un digest SHA-256 real (mezcla texto con ceros, no son 64 hex). A diferencia de Cloud SQL/Redis/IAM (que no validan contenido de una imagen inexistente), Cloud Run sí valida el FORMATO de la referencia de imagen al crear el servicio. Los otros 5 recursos restantes (Load Balancer completo) dependen de que Cloud Run exista, así que fallan en cascada por la misma causa.
+
+**Decisión tomada con el usuario:** en vez de dejar la Fase 2 con esos 6 recursos pendientes hasta la Fase 3 formal, se decidió adelantar la construcción de una imagen mínima YA, para desbloquear y cerrar el 100% de la Fase 2 en esta misma sesión. Esto requiere reconocer un obstáculo real: el Dockerfile existente asume código de la aplicación OMS real (`COPY package.json`, `npm ci`, `CMD ["node", "server.js"]`), pero ese código **no existe en este repositorio y no debe existir** — el enunciado es explícito: *"Tu trabajo en este bloque NO es implementar la aplicación —eso vendrá en bloques posteriores—"*.
+
+**Solución: un "hola mundo" placeholder de infraestructura, claramente rotulado como tal, NUNCA como la app OMS real.** Se crearon 3 archivos nuevos en `oms-platform/docker/`:
+
+- `server.js` — servidor HTTP mínimo con el módulo nativo `http` de Node (sin Express ni dependencias de terceros), que responde `200 OK` en `/healthz` y un JSON informativo en `/`. Encabezado del archivo deja explícito que NO implementa lógica de negocio del dominio OMS.
+- `package.json` — sin `dependencies`, con una `description` que documenta el propósito exacto y cita el enunciado.
+- `package-lock.json` — lockfile vacío de paquetes (coherente con no tener dependencias), necesario porque el Dockerfile ya hacía `COPY package.json package-lock.json ./`.
+
+**Hallazgo durante el primer build — `node_modules` no existe cuando no hay dependencias:**
+
+```bash
+docker build --build-arg GIT_SHA=<sha> --build-arg BUILD_DATE=<fecha> -t oms-placeholder:local .
+```
+
+Falló en la etapa de runtime:
+```
+Step 8/17 : COPY --from=deps /app/node_modules ./node_modules
+COPY failed: stat app/node_modules: file does not exist
+```
+
+**Diagnóstico:** `npm ci --omit=dev` sobre un `package.json` SIN `dependencies` no crea la carpeta `node_modules` en absoluto (no hay nada que instalar) — y el `COPY --from=deps` de la segunda etapa multi-stage la esperaba de todos modos.
+
+**Corrección aplicada** en `oms-platform/docker/Dockerfile`: `RUN npm ci --omit=dev && mkdir -p node_modules` — crea el directorio explícitamente si no existe, sin afectar el comportamiento cuando sí haya dependencias reales en el futuro (la app real del bloque de implementación).
+
+**Completado también el TODO original del Dockerfile** (labels OCI): se agregó `ARG GIT_SHA` y `ARG BUILD_DATE` (inyectados en build-time, no hardcodeados) y labels adicionales (`created`, `vendor`, `title`, `description`), con `source` apuntando al repo real (`ftoscanomarquez/acmeoms-infraestructura`) en vez del placeholder `TODO-org/oms`.
+
+**Reintento del build — exitoso:**
+
+```bash
+docker build --build-arg GIT_SHA=ff5487c2e36f5d2677ba75885730e9fa87da904f \
+  --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  -t oms-placeholder:local .
+```
+
+Resultado: `Successfully built` — los 17 pasos completados, incluyendo `HEALTHCHECK`, `USER oms` (no-root), y las labels OCI con los valores reales inyectados por build-arg.
+
+**Verificación local (antes de subir nada a GCP):**
+
+```bash
+docker run -d --name oms-test -p 18080:8080 oms-placeholder:local
+curl -sS http://localhost:18080/healthz   # → {"status":"ok"}
+curl -sS http://localhost:18080/          # → mensaje aclaratorio de que es un placeholder
+docker logs oms-test                       # → {"event":"server_started","port":"8080"}
+docker rm -f oms-test                      # limpieza del contenedor de prueba
+```
+
+Todo correcto: el placeholder responde bien a `/healthz` (el endpoint que consultarán las probes de Cloud Run y el health check del Load Balancer).
+
+---
+
+### 2.6 · Hallazgo de arquitectura señalado por el usuario: Artifact Registry debe gestionarse con Terraform, no a mano
+
+**Contexto:** antes de hacer `docker push`, se necesitaba que el repositorio de Artifact Registry existiera en GCP. Se ejecutó inicialmente por comando directo:
+
+```bash
+gcloud artifacts repositories create oms --repository-format=docker \
+  --location=europe-west3 --project=acmeoms-staging-fatm
+```
+
+**El usuario señaló correctamente el problema antes de continuar:** crear este recurso a mano, fuera de Terraform, es una inconsistencia real de arquitectura — Terraform nunca lo conocería, así que un futuro `terraform destroy` lo dejaría huérfano (coste indefinido, fuera de control del proyecto), y además rompe la reproducibilidad: recrear el proyecto desde cero requeriría acordarse de este paso manual aparte, contradiciendo el principio de Infraestructura como Código que exige el enunciado.
+
+**Corrección aplicada:**
+
+1. Se eliminó el repositorio creado a mano: `gcloud artifacts repositories delete oms --location=europe-west3 --project=acmeoms-staging-fatm --quiet` → `Deleted repository [oms]`.
+2. Se agregó correctamente como recurso de Terraform en `modules/compute/main.tf`:
+
+```hcl
+resource "google_artifact_registry_repository" "oms" {
+  location      = var.region
+  repository_id = "oms"
+  format        = "DOCKER"
+  description   = "Repositorio de imágenes Docker del OMS (AcmeOMS)."
+  labels        = var.labels
+}
+```
+
+3. Nuevo output `artifact_registry_url` (URL completa del repo), útil para el pipeline de CI/CD en la Fase 6.
+
+**Validación:** `terraform validate` → `Success! The configuration is valid.`
+
+**Lección:** cualquier recurso que el proyecto necesite de forma persistente (no solo artefactos efímeros como una imagen individual) debe declararse en Terraform desde el principio, incluso si en el momento parece "más rápido" crearlo a mano para desbloquear un paso siguiente — la disciplina de Infraestructura como Código no admite atajos parciales.
+
+**Resultado del plan:** `Plan: 7 to add` confirmado (los 6 recursos de Cloud Run/Load Balancer + el nuevo repositorio de Artifact Registry). Se decidió aplicar el repositorio PRIMERO por separado, para poder hacer el push de la imagen real cuanto antes:
+
+```bash
+terraform apply -var-file=envs/staging.tfvars \
+  -target=module.compute.google_artifact_registry_repository.oms -auto-approve
+```
+
+Resultado: `Apply complete! Resources: 1 added` — repositorio creado correctamente vía Terraform esta vez (`id=projects/acmeoms-staging-fatm/locations/europe-west3/repositories/oms`).
+
+---
+
+## Fase 3 — Docker + primer despliegue manual
+
+### 3.1 · Autenticar Docker con Artifact Registry: hallazgo de incompatibilidad Windows/WSL
+
+**Contexto:** para poder subir (`docker push`) la imagen construida al repositorio de Artifact Registry recién creado, Docker necesita autenticarse contra ese registro privado.
+
+**Primer intento — el helper estándar de gcloud:**
+
+```bash
+gcloud auth configure-docker europe-west3-docker.pkg.dev --quiet
+# → Docker configuration file updated.
+
+docker tag oms-placeholder:local europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms:0.1.0
+docker push europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms:0.1.0
+```
+
+**Resultado:** falló al hacer push:
+```
+error getting credentials - err: exec: "docker-credential-gcloud": executable file not found in $PATH
+```
+
+**Diagnóstico:** el mismo tipo de problema de PATH ya visto en la Fase 0 (§ 0.5) con `gcloud`, pero esta vez sin solución tan simple. `gcloud auth configure-docker` configuró Docker para usar el helper `docker-credential-gcloud` — pero ese binario, dentro de la instalación de gcloud usada en este proyecto (el SDK de Windows, montado vía `/mnt/c/...`), es un archivo `.cmd` de Windows (`docker-credential-gcloud.cmd`), NO un ejecutable nativo de Linux. Docker, corriendo dentro de WSL, invoca el helper como un subproceso directo — no puede ejecutar un `.cmd` de Windows así, aunque esté "en el PATH" en sentido amplio (a diferencia de invocar `gcloud` como comando normal, que sí funciona por la capa de interoperabilidad de WSL con ejecutables Windows).
+
+**Segundo intento descartado — `docker login` con token manual:** se probó autenticar con `gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin ...`, pero falló con el MISMO error al intentar *guardar* las credenciales tras el login (el `credHelpers` configurado en `~/.docker/config.json` por el primer intento seguía apuntando al mismo `.cmd` incompatible).
+
+**Solución aplicada — instalar un helper de credenciales nativo de Linux, sin necesitar `sudo`/`apt`:**
+
+```bash
+# Descargar el binario nativo (Go, multiplataforma) docker-credential-gcr
+# — alternativa oficial de Google al helper de gcloud, distribuida como
+# binario standalone en GitHub Releases, sin depender de una instalación
+# completa del SDK:
+curl -fsSL 'https://github.com/GoogleCloudPlatform/docker-credential-gcr/releases/download/v2.1.22/docker-credential-gcr_linux_amd64-2.1.22.tar.gz' -o /tmp/gcr.tar.gz
+tar -xzf /tmp/gcr.tar.gz -C /tmp
+mkdir -p ~/.local/bin
+mv /tmp/docker-credential-gcr ~/.local/bin/
+chmod +x ~/.local/bin/docker-credential-gcr
+
+# Configurar Docker para usar ESTE helper (nativo) para Artifact Registry:
+export PATH=$PATH:~/.local/bin
+docker-credential-gcr configure-docker --registries=europe-west3-docker.pkg.dev
+# → /home/franc/.docker/config.json configured to use this credential helper
+
+# Autenticar el helper con las credenciales de gcloud ya activas:
+docker-credential-gcr gcloud-auth
+```
+
+**Nota — intento previo descartado:** se intentó primero instalar el SDK completo de Google Cloud nativamente en WSL vía `apt-get install` (que habría incluido el helper nativo también), pero requería `sudo` y la sesión no soporta entrada interactiva de contraseña — se abandonó ese camino en favor del binario standalone, más simple y sin privilegios de administrador.
+
+**Push exitoso tras la corrección:**
+
+```bash
+export PATH=$PATH:~/.local/bin
+docker push europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms:0.1.0
+```
+
+Resultado:
+```
+0.1.0: digest: sha256:99082a531fa7bbb2d284358f3af6ec0a9ac205a64272dd34a78f5d142b2a47ac size: 2051
+```
+
+**Digest real obtenido:** `sha256:99082a531fa7bbb2d284358f3af6ec0a9ac205a64272dd34a78f5d142b2a47ac`
+
+**Lección para reproducir esto en el futuro:** cuando se trabaja con GCP CLI instalado en Windows pero se ejecutan comandos de Docker desde WSL, cualquier herramienta que dependa de invocar un binario de `gcloud` como subproceso directo (no como comando de terminal) puede fallar por la diferencia entre ejecutables `.cmd` de Windows y binarios nativos de Linux. La solución general es usar/instalar la variante nativa de Linux de esa herramienta específica, en vez de depender de la instalación de Windows para todo.
+
+**Secuencia completa de 4 pasos, explicada al usuario durante este bloque:** `docker build` (empaqueta la app en una imagen, solo existe localmente) → autenticación (Artifact Registry es privado, protegido por IAM, Docker necesita credenciales válidas) → `docker tag` (le da a la imagen el nombre completo de destino remoto, sin duplicar contenido) → `docker push` (transfiere las capas al registro remoto; GCP calcula el digest SHA-256 real al recibirla, que es el `image_sha` que Terraform necesita).
+
+### 3.2 · Actualizar `image_sha` con el digest real
+
+**Cambio en `envs/staging.tfvars`:**
+
+```hcl
+# Antes:
+image_repo = "europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms"
+image_sha  = "sha256:0000000000000000000000000000000000000000000000000000000000PENDIENTE_FASE_3"
+
+# Ahora:
+image_repo = "europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms"
+image_sha  = "sha256:99082a531fa7bbb2d284358f3af6ec0a9ac205a64272dd34a78f5d142b2a47ac"
+```
+
+(Se corrigió también `image_repo`, que le faltaba el segmento del nombre de la imagen dentro del repositorio — la ruta real usada en el push fue `.../oms/oms:0.1.0`, repo `oms` + imagen `oms`.)
+
+**Resultado del `terraform apply` final:** `Apply complete! Resources: 6 added, 0 changed, 0 destroyed.` — Cloud Run, NEG, backend service, URL map, target HTTPS proxy y forwarding rule creados exitosamente. Outputs: `cloud_run_url = "https://oms-staging-7ifhynkuua-ey.a.run.app"`, `load_balancer_ip = "136.68.140.101"`.
+
+**Los 38 recursos totales del proyecto (network + database + compute + iam) están aplicados en GCP staging real.**
+
+---
+
+### 3.3 · Verificación funcional del despliegue: dos hallazgos reales antes de dar por bueno el resultado
+
+**Contexto:** en vez de asumir que "Terraform dijo Apply complete" significa que el servicio funciona, se probó el endpoint real.
+
+**Hallazgo 1 — política IAM vacía (403/404 en TODA ruta).**
+
+```bash
+curl -sS -w '\nHTTP_STATUS:%{http_code}\n' https://oms-staging-7ifhynkuua-ey.a.run.app/healthz
+# → 404 (HTML genérico de Google)
+curl .../ → 403 Forbidden (HTML genérico de Google)
+```
+
+**Diagnóstico:** `gcloud run services get-iam-policy oms-staging ...` devolvió una política vacía (sin ningún `bindings`) — Cloud Run, por defecto, NO permite invocación sin autenticación. El servicio en sí estaba sano (`status.conditions: Ready = True`, confirmado con `gcloud run services describe`), pero la capa de IAM de Google rechazaba toda petición ANTES de llegar al contenedor (de ahí el HTML de error genérico de Google, no del propio `server.js`).
+
+**Corrección aplicada — permiso de invocación pública, vía Terraform (no manual):**
+
+```hcl
+resource "google_cloud_run_v2_service_iam_member" "public_invoker" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.oms.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+```
+
+Justificación de `allUsers` (no un principal más restrictivo): este es un servicio HTTP público destinado a recibir tráfico de clientes finales a través del Load Balancer (arquitectura objetivo del enunciado), no un servicio interno.
+
+`terraform apply -target=...public_invoker` → `Apply complete! Resources: 1 added`. Tras esto, `/` empezó a responder `200` con el JSON real del `server.js` — el binding funcionó.
+
+**Hallazgo 2 — `/healthz` específicamente seguía dando 404, aunque `/` ya funcionaba.**
+
+Diagnóstico por descarte, en este orden:
+1. Se esperó margen de propagación de IAM (90s) — no cambió nada para `/healthz`, aunque `/` sí funcionaba ya con normalidad. Esto aisló el problema a la ruta específica, no a IAM.
+2. Se probó forzando HTTP/1.1 en vez de HTTP/2 — mismo resultado, descartada la negociación de protocolo.
+3. **La prueba definitiva:** `gcloud run services logs read oms-staging ...` — los logs del contenedor mostraban únicamente las peticiones a `/` (la de 403 antes del binding, la de 200 después), pero **ninguna de las múltiples peticiones a `/healthz`** aparecía jamás registrada.
+
+**Diagnóstico confirmado:** `/healthz` es una ruta que **Google Front End (GFE) intercepta antes de que la petición llegue al contenedor**, en algunos productos serverless de GCP — es una convención histórica reservada internamente por Google (viene de sistemas internos de Borg/Kubernetes), no documentada de forma prominente para usuarios de Cloud Run. La petición nunca llega a Cloud Run en absoluto; GFE la resuelve por sí solo y devuelve un 404 genérico con su propio HTML de error — por eso nunca apareció en los logs del contenedor, ni con IAM correctamente configurado.
+
+Dato curioso: las **probes internas** de Cloud Run (`startup_probe`/`liveness_probe`) SÍ habían funcionado correctamente contra `/healthz` (el servicio llegó a `Ready: True`) — sugiere que esas probes usan un mecanismo interno distinto al del tráfico público externo, que sí pasa por GFE.
+
+**Corrección aplicada — renombrar el endpoint de `/healthz` a `/health` en TODO el proyecto:**
+
+| Archivo | Cambio |
+|---|---|
+| `docker/server.js` | `if (req.url === '/healthz')` → `'/health'`, con nota explicando el hallazgo |
+| `docker/Dockerfile` | `HEALTHCHECK ... http://127.0.0.1:8080/healthz` → `/health` |
+| `terraform/modules/compute/main.tf` | `startup_probe`/`liveness_probe`: `path = "/healthz"` → `"/health"` (ambas, con nota explicando que estas SÍ funcionaban, pero se estandarizó por consistencia) |
+| `ansible/group_vars/all.yml` | `health_path: "/healthz"` → `"/health"` (se corrigió de paso también `image_repo`, al que le faltaba el segmento del nombre de la imagen dentro del repositorio) |
+
+**Lección para reproducir esto en el futuro:** en Cloud Run (y posiblemente otros productos serverless de GCP), evitar el nombre `/healthz` para endpoints de salud propios — usar `/health`, `/status`, `/ping` u otro nombre no convencional-reservado. El síntoma característico de este problema es: la ruta da 404/403 con HTML genérico de Google (no de tu framework/app), Y la petición nunca aparece en los logs de la aplicación, aunque otras rutas del mismo servicio sí respondan y sí queden registradas.
+
+**Reconstrucción y nuevo push, con el fix aplicado:**
+
+```bash
+docker build --build-arg GIT_SHA=ff5487c2e36f5d2677ba75885730e9fa87da904f \
+  --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) -t oms-placeholder:local .
+docker tag oms-placeholder:local europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms:0.1.0
+export PATH=$PATH:~/.local/bin   # necesario para el credential helper en cada nueva shell
+docker push europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms:0.1.0
+```
+
+Nuevo digest: `sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25`
+
+**`envs/staging.tfvars` actualizado con el nuevo digest.** `terraform plan` mostró correctamente `0 to add, 1 to change` — SOLO el cambio de `path` en las probes (`/healthz` → `/health`), confirmando que **`image_sha` en `staging.tfvars` NO afecta al `apply`** (el `lifecycle { ignore_changes = [template[0].containers[0].image] }` del módulo `compute` funciona exactamente como se diseñó: Terraform gestiona la "forma" del contenedor, no qué imagen corre — eso es responsabilidad exclusiva del playbook de Ansible en la Fase 4).
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -auto-approve
+# → Apply complete! Resources: 0 added, 1 changed, 0 destroyed.
+```
+
+**Verificación final — `/health` funciona correctamente:**
+
+```bash
+curl -sSi https://oms-staging-7ifhynkuua-ey.a.run.app/health
+# → HTTP/2 200, content-type: application/json
+# → {"message":"Placeholder de infraestructura...", ...}
+```
+
+Nota esperada: responde el JSON de la ruta raíz `/` (no `{"status":"ok"}`) porque la imagen que sigue corriendo es la ANTIGUA (`sha256:99082a53...`, que solo conocía `/healthz`) — confirma exactamente el diseño correcto: Terraform ya no toca la imagen desplegada tras el primer `apply`, la actualización real de imagen (con el código de `/health` ya corregido) queda pendiente para el playbook de Ansible en la Fase 4.
+
+**Estado final de la Fase 2: ✅ COMPLETA.** Los 38 recursos totales del proyecto (`network` + `database` + `compute` + `iam`) aplicados y verificados funcionalmente en `acmeoms-staging-fatm`. Cloud Run público y accesible (`https://oms-staging-7ifhynkuua-ey.a.run.app`), Load Balancer con IP fija (`136.68.140.101`, certificado en `PROVISIONING` hasta tener dominio real), WIF configurado para GitHub Actions. Pendiente para Fase 4: desplegar la imagen corregida (`sha256:fcd5c9...`) vía Ansible para que `/health` responda con el JSON correcto de la ruta de salud.

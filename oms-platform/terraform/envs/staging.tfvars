@@ -13,14 +13,15 @@ db_tier    = "db-custom-2-7680"        # 2 vCPU, 7.5 GB RAM
 cloud_run_min_instances = 0            # escala a cero cuando no hay tráfico
 cloud_run_max_instances = 5            # tope conservador para staging
 
-# NOTA: image_repo/image_sha se completan de verdad en la Fase 3 (build +
-# push de la imagen Docker a Artifact Registry). No afectan al plan/apply
-# dirigido de la Fase 1 (-target=module.network -target=module.database),
-# que no toca el módulo `compute` — pero Terraform exige un valor sintácticamente
-# válido para poder parsear las variables, así que se deja un placeholder
-# explícito que fallaría de forma obvia si se usara antes de tiempo.
-image_repo = "europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms"
-image_sha  = "sha256:0000000000000000000000000000000000000000000000000000000000PENDIENTE_FASE_3"
+# image_sha REAL (Fase 3): digest obtenido tras `docker push` de un
+# placeholder minimo de infraestructura (oms-platform/docker/server.js —
+# NO es la aplicación OMS real, ver Trabajo - enunciado.md sección 1).
+# Ver oms-platform/BITACORA-COMANDOS.md Fase 3 para el proceso completo.
+# NOTA: este digest ya corresponde a la versión con endpoint /health (no
+# /healthz — ver hallazgo real documentado en BITACORA-COMANDOS.md § 3.3:
+# Google Front End interceptaba /healthz antes de llegar a Cloud Run).
+image_repo = "europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms"
+image_sha  = "sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25"
 
 deletion_protection = true             # también en staging
 
