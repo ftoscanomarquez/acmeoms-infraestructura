@@ -8,7 +8,7 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** ✅ Fase 1 y Fase 2 COMPLETAS → arrancando Fase 3 (Ansible: staging)
+**Fase en curso:** ✅ Fases 1, 2 y 3 COMPLETAS → arrancando Fase 4 (Ansible: staging)
 **Último hito completado:** **Los 38 recursos totales del proyecto están aplicados y verificados funcionalmente en GCP staging real** (`acmeoms-staging-fatm`): `network` (10) + `database` (7) + `compute` (10, incluye Artifact Registry y el binding IAM público) + `iam` (11). Cloud Run público y accesible: `https://oms-staging-7ifhynkuua-ey.a.run.app`. Load Balancer con IP fija `136.68.140.101` (certificado SSL en `PROVISIONING` hasta tener dominio real). Se resolvieron **7 hallazgos reales** durante el proceso (ver `BITACORA-COMANDOS.md` para el detalle completo de cada uno): 2 APIs de GCP faltantes en la Fase 0 (`servicenetworking`, `vpcaccess`), una condición de carrera de Terraform (`depends_on` explícito), un recurso creado a mano corregido a Terraform (Artifact Registry, señalado correctamente por el usuario), un problema de credenciales Docker en WSL (helper `.cmd` de Windows incompatible, resuelto con `docker-credential-gcr` nativo), una política IAM de Cloud Run vacía (agregado `roles/run.invoker` para `allUsers`), y el hallazgo más sutil: **`/healthz` es interceptado por Google Front End antes de llegar a Cloud Run** — se renombró el endpoint a `/health` en todo el proyecto (`server.js`, `Dockerfile`, Terraform, Ansible).
 **Siguiente paso concreto:** Fase 4 (Ansible: staging) — completar `deploy.yml`/`rollback.yml`/el role `oms_cloud_run`, y ejecutar el primer despliegue real con el `image_sha` corregido (`sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25`) para que `/health` sirva la respuesta correcta (`{"status":"ok"}`) en vez del contenido de la imagen anterior.
 
@@ -63,13 +63,14 @@
 - [x] Verificar recursos en consola GCP — Cloud Run público y funcional (`curl /health` → 200 OK)
 - [ ] Segundo `terraform plan` → confirmar "No changes" (pendiente de re-verificar tras los últimos cambios de esta sesión)
 
-### Fase 3 — Docker + primer despliegue manual (adelantada parcialmente durante la Fase 2)
+### Fase 3 — Docker + primer despliegue manual ✅ COMPLETA (adelantada durante la Fase 2)
 
 - [x] Completar `Dockerfile` (labels OCI reales con `ARG GIT_SHA`/`BUILD_DATE`, endpoint `/health`)
 - [x] Build local de la imagen (placeholder mínimo `server.js`, NO es la app OMS real — ver nota en el propio código)
 - [x] Push manual a Artifact Registry → `image_sha` real obtenido: `sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25`
 - [x] Verificar `docker run` local + healthcheck (probado antes del push)
-- [ ] Desplegar esta imagen corregida a Cloud Run vía Ansible (pendiente, es la Fase 4 — recordar que Terraform ignora cambios de imagen deliberadamente)
+
+> Nota: el DESPLIEGUE de esta imagen a Cloud Run (que la ponga a servir tráfico real) no es un paso de la Fase 3 — es el contenido completo de la Fase 4 (Ansible), donde el `image_sha` se pasa como parámetro `-e` al playbook, no editando archivos. Recuerda que Terraform ignora deliberadamente los cambios de imagen (`lifecycle.ignore_changes`) desde el primer `apply` de Cloud Run.
 
 ### Fase 4 — Ansible: staging
 
