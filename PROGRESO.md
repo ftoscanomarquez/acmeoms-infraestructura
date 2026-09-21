@@ -8,9 +8,9 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** ✅ Fase 0 completa al 100% → arrancando Fase 1 (Terraform: red y datos)
-**Último hito completado:** Las 7 APIs de GCP habilitadas en ambos proyectos (`compute`, `sqladmin`, `run`, `redis`, `secretmanager`, `iamcredentials`, `artifactregistry`), y los 2 buckets de estado remoto de Terraform creados y versionados: `gs://acmeoms-staging-fatm-tfstate` y `gs://acmeoms-production-fatm-tfstate` (ambos en `europe-west3`).
-**Siguiente paso concreto:** Fase 1 — descomentar/completar el backend `gcs` en `terraform/main.tf`, luego completar el módulo `network` (subredes multi-zona, Cloud NAT, firewall) y ejecutar el primer `terraform init` + `plan`.
+**Fase en curso:** Fase 1 — Terraform: red y datos (1er punto completo, 5 restantes)
+**Último hito completado:** Módulo `network` completo — resueltos los 3 TODOs (subredes multi-zona reinterpretadas como segmentación por propósito con una subred `connector` nueva, Cloud NAT con router, y 3 reglas de firewall explícitas) con `terraform validate` exitoso. Ver `oms-platform/BITACORA-COMANDOS.md` § Fase 1 para el detalle técnico completo (incluye toda la teoría de redes explicada: CIDR, máscaras, VLSM, NAT, IAP, health checks).
+**Siguiente paso concreto:** `terraform validate` + `terraform plan` del módulo `network` ya integrado en la configuración raíz (`terraform/main.tf`) — para esto falta primero descomentar/completar el backend `gcs`. Después: completar el módulo `database` (password vía Secret Manager, database_flags).
 
 ---
 
@@ -48,8 +48,8 @@
 
 ### Fase 1 — Terraform: red y datos
 
-- [ ] Completar módulo `network` (subredes multi-zona, Cloud NAT, firewall)
-- [ ] `terraform validate` + `terraform plan` del módulo network
+- [x] Completar módulo `network` (subredes multi-zona → reinterpretado como segmentación por propósito con subred `connector`; Cloud NAT; 3 reglas de firewall) — `terraform validate` exitoso en aislado
+- [ ] `terraform validate` + `terraform plan` del módulo network (integrado en la raíz, requiere backend gcs configurado)
 - [ ] Completar módulo `database` (password vía Secret Manager, database_flags)
 - [ ] `terraform plan` con network + database
 - [ ] Primer `terraform apply` real a staging (network + database)

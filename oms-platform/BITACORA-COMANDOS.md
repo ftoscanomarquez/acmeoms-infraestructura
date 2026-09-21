@@ -16,7 +16,7 @@ Ver también [`../PROGRESO.md`](../PROGRESO.md) para el estado general por fases
 ## Índice de fases
 
 - [Fase 0 — Cuentas, accesos y doble remoto](#fase-0--cuentas-accesos-y-doble-remoto)
-- Fase 1 — Terraform: red y datos (pendiente)
+- [Fase 1 — Terraform: red y datos](#fase-1--terraform-red-y-datos)
 - Fase 2 — Terraform: cómputo e IAM (pendiente)
 - Fase 3 — Docker + primer despliegue manual (pendiente)
 - Fase 4 — Ansible: staging (pendiente)
@@ -552,3 +552,68 @@ Ambos buckets creados en `europe-west3`, con acceso uniforme y versionado activo
 
 - Todavía no se ha ejecutado ningún comando real contra GCP ni GitHub — esta sección se irá actualizando con fechas, salidas reales y cualquier desviación respecto a lo aquí previsto.
 - Cualquier ID real de proyecto, cuenta de facturación o URL de repositorio se documentará aquí en cuanto exista (evitando credenciales o tokens, solo identificadores no sensibles).
+
+---
+
+## Fase 1 — Terraform: red y datos
+
+### 1.1 · Módulo `network` — resolución de los 3 TODOs (subredes, Cloud NAT, firewall)
+
+**Contexto:** `oms-platform/terraform/modules/network/main.tf` traía 3 bloques con `TODO(alumno)` sin resolver. Se completaron los tres, documentando en el propio código (comentarios "NOTA DE DISEÑO") qué se agregó y por qué, para que quede trazable sin depender de esta bitácora. Aquí se resume la sesión de trabajo y las decisiones tomadas; el detalle conceptual completo (qué es una máscara de red, cómo se calculan los rangos CIDR, qué es VLSM, qué es NAT, qué es IAP) se explicó de forma extensa en la conversación con el usuario antes de escribir cada bloque — se referencia aquí en vez de repetirlo íntegro.
+
+**TODO 1 · Subredes multi-zona → reinterpretado como segmentación por propósito.**
+
+Hallazgo importante: en GCP, una subred **no está atada a una zona** — abarca automáticamente todas las zonas de la `region` indicada (a diferencia de AWS, donde sí). Por eso "dos subredes en zonas distintas" no se resuelve duplicando la misma subred, sino creando subredes con **propósitos distintos** (segmentación). Se agregó una segunda subred `connector`, reservada para el VPC Access Connector que Cloud Run necesitará en la Fase 2 para hablar con Redis por IP privada.
+
+Cálculo de rangos usado (función `cidrsubnet(base, bits_agregados, índice)`):
+
+```hcl
+# private (ya existía):
+cidrsubnet(var.vpc_cidr, 4, 0)   # /16 + 4 bits = /20 → 10.20.0.0/20 (4.096 IPs)
+
+# connector (agregado):
+cidrsubnet(var.vpc_cidr, 4, 1)   # mismo tamaño /20, índice distinto → 10.20.16.0/20
+```
+
+`cidrsubnet` corta el `/16` de origen en 2^bits_agregados franjas iguales; cada índice selecciona una franja distinta y garantizadamente disjunta de las demás — por eso basta con usar un índice distinto (1 en vez de 0) para no solaparse con `private`. Se agregaron los outputs `connector_subnet_id` y `connector_subnet_cidr` para que el módulo `compute` los consuma en la Fase 2.
+
+**TODO 2 · Cloud NAT.**
+
+Ningún recurso del proyecto tiene IP pública (Cloud SQL, Redis, ambas subredes). Una IP privada no es enrutable desde internet, así que cualquier conexión **saliente** hacia internet (ej. una llamada a una API externa, o una VM descargando paquetes) necesita un NAT que traduzca esa IP privada a una IP pública propia del NAT. Es tráfico de un solo sentido: nunca permite conexiones entrantes no solicitadas hacia el recurso privado.
+
+```hcl
+resource "google_compute_router" "main" { ... }        # Cloud NAT en GCP siempre cuelga de un Cloud Router
+resource "google_compute_router_nat" "main" {
+  nat_ip_allocate_option              = "AUTO_ONLY"                       # Google asigna las IPs públicas automáticamente
+  source_subnetwork_ip_ranges_to_nat  = "ALL_SUBNETWORKS_ALL_IP_RANGES"   # aplica a todas las subredes de la VPC
+  log_config { enable = true, filter = "ERRORS_ONLY" }                    # agregado por el equipo: solo logs de fallos, evita ruido
+}
+```
+
+**TODO 3 · Firewall (deny-all por defecto + 3 reglas explícitas).**
+
+GCP ya deniega todo el tráfico entrante por defecto en una VPC custom (incluso entre recursos de la misma VPC) y permite todo el saliente — las reglas creadas son excepciones puntuales sobre ese "todo cerrado":
+
+| Regla | Qué permite | Origen (`source_ranges`) | Por qué ese rango |
+|---|---|---|---|
+| `allow-internal` | TCP/UDP (todos los puertos) + ICMP | `var.vpc_cidr` (10.20.0.0/16) | Sin esto, recursos de la propia VPC no podrían hablarse entre sí (ej. Cloud Run → Redis) |
+| `allow-iap-ssh` | TCP 22, solo a VMs con tag `iap-ssh` | `35.235.240.0/20` | Rango oficial y fijo publicado por Google para el tráfico saliente de Identity-Aware Proxy — permite SSH sin exponer la VM ni el puerto 22 a internet. Preparado para el bastion del bonus (Fase 7), hoy no afecta a ningún recurso (nada tiene ese tag todavía) |
+| `allow-lb-health-checks` | TCP 8080 | `130.211.0.0/22`, `35.191.0.0/16` | Rangos oficiales del GFE (Google Front End) desde donde salen los health checks del Load Balancer (Fase 2) hacia el puerto de la app |
+
+**Validación ejecutada** (módulo aislado, sin backend, solo para comprobar sintaxis y referencias antes de integrarlo a la configuración raíz):
+
+```bash
+cd oms-platform/terraform/modules/network
+terraform init -backend=false
+terraform validate
+```
+
+Resultado:
+```
+Terraform has been successfully initialized!
+Success! The configuration is valid.
+```
+
+Se usó `-backend=false` porque en este punto solo interesa validar sintaxis/referencias del módulo por separado, no conectar a ningún backend remoto (eso se hace desde la raíz de `terraform/` en un paso posterior de esta misma fase). Los artefactos temporales de esta validación (`.terraform/`, `.terraform.lock.hcl`) se borraron después, para no dejar residuos fuera de lugar en el repo.
+
+**Estado:** ✅ hecho — 2026-09-21. Módulo `network` completo y validado. Pendiente: validar junto con el resto de módulos desde la raíz de `terraform/` (requiere primero configurar el backend `gcs`, ver Fase 0 § 0.7).
