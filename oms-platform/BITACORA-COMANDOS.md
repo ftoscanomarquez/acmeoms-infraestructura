@@ -1122,4 +1122,80 @@ Resultado: **`Success! The configuration is valid.`** — Los 4 módulos (`netwo
 
 **Siguiente paso:** `terraform plan` completo (sin `-target`) contra staging, y de ser limpio, `terraform apply` completo.
 
+---
+
+### 2.4 · `terraform plan` completo (sin `-target`) contra staging
+
+**Comando ejecutado:**
+
+```bash
+cd oms-platform/terraform
+terraform plan -var-file=envs/staging.tfvars
+```
+
+**Resultado — limpio:**
+
+```
+Plan: 20 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + cicd_service_account       = (known after apply)
+  + cloud_run_url              = (known after apply)
+  + load_balancer_ip           = (known after apply)
+  + workload_identity_provider = (known after apply)
+```
+
+**0 cambios sobre los 17 recursos de `network`+`database` ya aplicados en la Fase 1** — confirma que el estado remoto sigue siendo consistente y que completar `compute`/`iam` no provocó ningún efecto colateral sobre lo ya existente. Detalle verificado en el plan: `REDIS_HOST` en las env vars de Cloud Run ya trae la IP privada real de Redis (`10.152.126.148`, la misma que se obtuvo en la Fase 1) — confirma que las referencias entre módulos (`module.database.redis_host` → `module.compute`) funcionan correctamente.
+
+**Desglose completo de los 37 recursos totales del proyecto** (documentado a petición del usuario, para tener claridad de qué es "viejo" y qué es "nuevo" en este punto):
+
+**17 ya existentes desde la Fase 1** (`0 to change` en este plan — reconocidos tal cual en el estado):
+
+| # | Módulo | Recurso | Qué es |
+|---|---|---|---|
+| 1 | network | `google_compute_network.main` | VPC `oms-staging-vpc` |
+| 2 | network | `google_compute_subnetwork.private` | Subred `10.20.0.0/20` |
+| 3 | network | `google_compute_subnetwork.connector` | Subred `10.20.16.0/20` |
+| 4 | network | `google_compute_global_address.private_service_range` | Rango reservado para peering |
+| 5 | network | `google_service_networking_connection.private_vpc_connection` | Conexión de peering |
+| 6 | network | `google_compute_router.main` | Cloud Router |
+| 7 | network | `google_compute_router_nat.main` | Cloud NAT |
+| 8 | network | `google_compute_firewall.allow_internal` | Regla: tráfico interno VPC |
+| 9 | network | `google_compute_firewall.allow_iap_ssh` | Regla: SSH vía IAP |
+| 10 | network | `google_compute_firewall.allow_lb_health_checks` | Regla: health checks del LB |
+| 11 | database | `random_password.db_password` | Password generada |
+| 12 | database | `google_secret_manager_secret.db_password` | Contenedor del secreto |
+| 13 | database | `google_secret_manager_secret_version.db_password` | Versión con el valor |
+| 14 | database | `google_sql_database_instance.main` | Instancia Cloud SQL |
+| 15 | database | `google_sql_database.oms` | Base de datos `oms` |
+| 16 | database | `google_sql_user.oms` | Usuario `oms_app` |
+| 17 | database | `google_redis_instance.cache` | Instancia Redis |
+
+**20 nuevos en este plan** (`to add`, Fase 2 — módulos `compute` e `iam`):
+
+| # | Módulo | Recurso | Qué es |
+|---|---|---|---|
+| 18 | compute | `google_service_account.cloud_run` | SA de runtime |
+| 19 | compute | `google_vpc_access_connector.redis` | VPC Access Connector (TODO#2) |
+| 20 | compute | `google_cloud_run_v2_service.oms` | El servicio Cloud Run |
+| 21 | compute | `google_compute_region_network_endpoint_group.cloud_run_neg` | NEG serverless |
+| 22 | compute | `google_compute_backend_service.default` | Backend Service (con CDN) |
+| 23 | compute | `google_compute_url_map.default` | URL Map |
+| 24 | compute | `google_compute_managed_ssl_certificate.default` | Certificado SSL (TODO#3, quedará en PROVISIONING) |
+| 25 | compute | `google_compute_target_https_proxy.default` | Target HTTPS Proxy (TODO#3) |
+| 26 | compute | `google_compute_global_address.lb_ip` | IP pública del LB |
+| 27 | compute | `google_compute_global_forwarding_rule.https` | Forwarding Rule (TODO#3) |
+| 28 | iam | `google_iam_workload_identity_pool.github` | Pool WIF |
+| 29 | iam | `google_iam_workload_identity_pool_provider.github` | Provider WIF |
+| 30 | iam | `google_service_account.cicd` | SA del pipeline de CI/CD |
+| 31 | iam | `google_service_account_iam_binding.cicd_wif` | Binding pool ↔ SA (impersonación) |
+| 32 | iam | `google_project_iam_member.cicd["roles/run.developer"]` | Rol: desplegar Cloud Run |
+| 33 | iam | `google_project_iam_member.cicd["roles/iam.serviceAccountUser"]` | Rol: usar SA de runtime |
+| 34 | iam | `google_project_iam_member.cicd["roles/artifactregistry.writer"]` | Rol: publicar imágenes |
+| 35 | iam | `google_project_iam_member.cicd["roles/artifactregistry.reader"]` | Rol: leer imágenes |
+| 36 | iam | `google_project_iam_member.runtime_sql_client` | Rol: SA runtime conecta a Cloud SQL |
+| 37 | iam | `google_project_iam_member.runtime_secret_accessor` | Rol: SA runtime lee el secreto |
+
+**Siguiente paso:** `terraform apply` completo contra staging.
+
 **Estado:** ✅ verificación por API hecha — 2026-09-21. Verificación visual en consola: pendiente de confirmación del usuario.
