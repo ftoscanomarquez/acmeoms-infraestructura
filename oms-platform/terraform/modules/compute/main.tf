@@ -13,12 +13,52 @@ variable "db_connection_name"      { type = string }
 variable "db_secret_id"            { type = string }
 variable "redis_host"              { type = string }
 variable "labels"                  { type = map(string) }
+# Agregado por el equipo: subred dedicada (preparada en el módulo network,
+# Fase 1) para el VPC Access Connector que permite a Cloud Run alcanzar
+# Memorystore Redis por IP privada.
+variable "connector_subnet_id"     { type = string }
+# Agregado por el equipo: dominio para el certificado SSL managed del Load
+# Balancer. DECISIÓN DOCUMENTADA (ver BITACORA-COMANDOS.md Fase 2): un
+# dominio real es un recurso que se compra por separado a un registrador
+# (no lo provee ni lo cubre el crédito de GCP) y requiere un registro DNS
+# tipo A apuntando a la IP del Load Balancer para que Google pueda
+# verificarlo y emitir el certificado. Mientras no exista ese dominio real,
+# se usa un placeholder explícito — el certificado se crea igual pero
+# queda en estado "PROVISIONING" indefinidamente (no bloquea el resto del
+# despliegue). Cloud Run sigue siendo accesible por su propia URL nativa
+# con HTTPS ya válido (output cloud_run_url) mientras tanto.
+variable "lb_domain" {
+  type    = string
+  default = "PENDIENTE-DOMINIO-REAL.example.com"
+}
 
 # ─── Service Account dedicada al runtime ──────────────────────────
 resource "google_service_account" "cloud_run" {
   account_id   = "oms-${var.env}-runtime"
   display_name = "OMS ${var.env} — Cloud Run runtime SA"
   description  = "Identidad del servicio Cloud Run. Bindings mínimos en módulo iam."
+}
+
+# ─── VPC Access Connector (Cloud Run → Redis por IP privada) ──────
+# NOTA DE DISEÑO (agregado por el equipo): Cloud Run, por defecto, vive
+# FUERA de la VPC (en la red gestionada de Google) y no tiene visibilidad
+# de recursos privados como Memorystore Redis (que deliberadamente no
+# tiene IP pública). El VPC Access Connector es el puente: un recurso que
+# vive DENTRO de una subred de la VPC (la subred `connector`, preparada en
+# el módulo network en la Fase 1 específicamente para este propósito) y
+# actúa de intermediario — Cloud Run le envía el tráfico destinado a la
+# red privada, y el connector lo reenvía hasta la IP privada de Redis.
+resource "google_vpc_access_connector" "redis" {
+  name    = "oms-${var.env}-connector"
+  region  = var.region
+  subnet {
+    name = var.connector_subnet_id
+  }
+  # Rango de instancias del connector: mínimo 2 (alta disponibilidad básica
+  # del propio connector), máximo 3 — tráfico esperado bajo (solo llamadas
+  # internas a Redis), no requiere escalar más.
+  min_instances = 2
+  max_instances = 3
 }
 
 # ─── Cloud Run service ────────────────────────────────────────────
@@ -81,8 +121,42 @@ resource "google_cloud_run_v2_service" "oms" {
         }
       }
 
-      # TODO(alumno): añade startup_probe y liveness_probe contra /healthz
-      # (la spec del Vídeo 1 los pide).
+      # NOTA DE DISEÑO (agregado por el equipo): dos sondas con propósitos
+      # distintos, ambas contra /healthz (el mismo endpoint que ya usa el
+      # HEALTHCHECK nativo de Docker en el Dockerfile — Cloud Run no lee ese
+      # HEALTHCHECK de Docker, tiene su propio mecanismo, por eso hace falta
+      # declararlo aquí también).
+      #
+      # startup_probe: se ejecuta SOLO al arrancar un contenedor nuevo (cada
+      # revisión nueva, cada instancia nueva al escalar). Mientras no pase,
+      # Cloud Run NO envía tráfico real a esa instancia — evita mandar
+      # peticiones de usuarios a un contenedor que aún está inicializando.
+      startup_probe {
+        http_get {
+          path = "/healthz"
+          port = 8080
+        }
+        initial_delay_seconds = 5    # tiempo antes del primer intento
+        period_seconds         = 5    # cada cuánto reintenta
+        timeout_seconds        = 3
+        failure_threshold      = 6    # hasta 6 intentos (~35s) antes de darlo por fallido
+      }
+
+      # liveness_probe: se ejecuta de forma CONTINUA durante toda la vida de
+      # la instancia (ya pasado el arranque). Si empieza a fallar de forma
+      # repetida, Cloud Run reinicia el contenedor automáticamente, sin
+      # intervención humana — el mecanismo técnico detrás de OPS-007
+      # ("el sistema debe degradar suavemente, no requerir intervención
+      # humana inmediata").
+      liveness_probe {
+        http_get {
+          path = "/healthz"
+          port = 8080
+        }
+        period_seconds    = 10
+        timeout_seconds   = 3
+        failure_threshold = 3
+      }
 
       volume_mounts {
         name       = "cloudsql"
@@ -90,8 +164,17 @@ resource "google_cloud_run_v2_service" "oms" {
       }
     }
 
-    # VPC connector para alcanzar Memorystore (red privada)
-    # TODO(alumno): crea un vpc_access connector y referéncialo aquí.
+    # VPC connector para alcanzar Memorystore (red privada) — recurso
+    # google_vpc_access_connector definido arriba, justo después del
+    # Service Account. "ALL_TRAFFIC" fuerza que TODO el tráfico saliente
+    # del contenedor (no solo el destinado a rangos privados) pase por el
+    # connector; se elige explícitamente porque, aunque Redis es el único
+    # destino privado hoy, la salida general a internet ya la resuelve el
+    # Cloud NAT del módulo network (Fase 1) sobre esta misma VPC.
+    vpc_access {
+      connector = google_vpc_access_connector.redis.id
+      egress    = "ALL_TRAFFIC"
+    }
   }
 
   traffic {
@@ -164,13 +247,45 @@ resource "google_compute_url_map" "default" {
   default_service = google_compute_backend_service.default.id
 }
 
-# TODO(alumno): genera un certificado managed para tu dominio.
-# resource "google_compute_managed_ssl_certificate" "default" { ... }
-# resource "google_compute_target_https_proxy" "default" { ... }
-# resource "google_compute_global_forwarding_rule" "https" { ... }
+# ─── Certificado SSL, proxy HTTPS y forwarding rule ───────────────
+# NOTA DE DISEÑO (agregado por el equipo): un "Google-managed SSL
+# certificate" es un certificado que Google emite y renueva automáticamente
+# (a diferencia de gestionar tú mismo certificados o Let's Encrypt manual —
+# ver CERTIFICADOS.md más adelante para esos escenarios). Requiere que el
+# dominio indicado (var.lb_domain) tenga un registro DNS tipo A apuntando
+# a la IP de `lb_ip` de abajo — sin eso, Google nunca puede completar la
+# validación y el certificado se queda en estado "PROVISIONING" para siempre
+# (no falla el `apply`, simplemente no llega nunca a "ACTIVE").
+resource "google_compute_managed_ssl_certificate" "default" {
+  name = "oms-${var.env}-cert"
+  managed {
+    domains = [var.lb_domain]
+  }
+}
+
+# Target HTTPS Proxy: la pieza que efectivamente TERMINA la conexión TLS
+# (descifra el tráfico HTTPS entrante) y consulta al url_map para decidir
+# a qué backend reenviar la petición ya descifrada.
+resource "google_compute_target_https_proxy" "default" {
+  name             = "oms-${var.env}-https-proxy"
+  url_map          = google_compute_url_map.default.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.default.id]
+}
 
 resource "google_compute_global_address" "lb_ip" {
   name = "oms-${var.env}-lb-ip"
+}
+
+# Global Forwarding Rule: asocia la IP pública reservada (lb_ip) con el
+# proxy HTTPS en el puerto 443 — es el "cable" final que conecta "esta IP
+# pública" con "ese proxy"; sin esto, la IP reservada existe pero no está
+# conectada a nada.
+resource "google_compute_global_forwarding_rule" "https" {
+  name                  = "oms-${var.env}-https-fr"
+  ip_address            = google_compute_global_address.lb_ip.address
+  port_range            = "443"
+  target                = google_compute_target_https_proxy.default.id
+  load_balancing_scheme = "EXTERNAL_MANAGED"
 }
 
 # ─── Outputs ──────────────────────────────────────────────────────

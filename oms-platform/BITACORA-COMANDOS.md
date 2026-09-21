@@ -17,7 +17,7 @@ Ver también [`../PROGRESO.md`](../PROGRESO.md) para el estado general por fases
 
 - [Fase 0 — Cuentas, accesos y doble remoto](#fase-0--cuentas-accesos-y-doble-remoto)
 - [Fase 1 — Terraform: red y datos](#fase-1--terraform-red-y-datos)
-- Fase 2 — Terraform: cómputo e IAM (pendiente)
+- [Fase 2 — Terraform: cómputo e IAM](#fase-2--terraform-cómputo-e-iam)
 - Fase 3 — Docker + primer despliegue manual (pendiente)
 - Fase 4 — Ansible: staging (pendiente)
 - Fase 5 — Producción (pendiente)
@@ -986,5 +986,140 @@ gcloud compute networks subnets list --project=acmeoms-staging-fatm --format='ta
 | Secret Manager | `https://console.cloud.google.com/security/secret-manager/secret/oms-staging-db-password/versions?project=acmeoms-staging-fatm` |
 
 **Qué se espera ver en cada una:** VPC en modo subredes "personalizado"; ambas subredes en `europe-west3` con los rangos ya indicados; Cloud SQL en estado verde "Runnable" con alta disponibilidad (por `REGIONAL`); Redis en nivel "Estándar" y estado "Listo"; el secreto con exactamente 1 versión (la password generada por `random_password`).
+
+---
+
+## Fase 2 — Terraform: cómputo e IAM
+
+### 2.1 · Módulo `compute` — resolución de los 3 TODOs (probes, VPC connector, SSL/HTTPS/forwarding rule)
+
+**Contexto:** `oms-platform/terraform/modules/compute/main.tf` traía 3 TODOs. Se resolvieron los tres, con el mismo patrón de comentarios "NOTA DE DISEÑO" en el código que en fases anteriores.
+
+**TODO 1 · startup_probe y liveness_probe contra `/healthz`.**
+
+Cloud Run no lee el `HEALTHCHECK` nativo de Docker (ya presente en el Dockerfile) — tiene su propio mecanismo de sondas, con dos tipos de propósito distinto:
+
+- `startup_probe`: se ejecuta SOLO al arrancar un contenedor nuevo. Mientras no pase, Cloud Run no envía tráfico real a esa instancia.
+- `liveness_probe`: se ejecuta de forma continua durante toda la vida de la instancia. Si falla repetidamente, Cloud Run reinicia el contenedor automáticamente — mecanismo técnico detrás de OPS-007 ("degradar suavemente, sin intervención humana inmediata").
+
+```hcl
+startup_probe {
+  http_get { path = "/healthz", port = 8080 }
+  initial_delay_seconds = 5
+  period_seconds         = 5
+  timeout_seconds        = 3
+  failure_threshold      = 6
+}
+liveness_probe {
+  http_get { path = "/healthz", port = 8080 }
+  period_seconds    = 10
+  timeout_seconds   = 3
+  failure_threshold = 3
+}
+```
+
+**TODO 2 · VPC Access Connector (Cloud Run → Redis por IP privada).**
+
+Cloud Run vive por defecto FUERA de la VPC (red gestionada de Google), sin visibilidad de recursos privados como Redis. El VPC Access Connector es el puente: vive dentro de una subred de la VPC — específicamente la subred `connector` (`10.20.16.0/20`) que se preparó en la Fase 1 justo para este propósito — y reenvía el tráfico de Cloud Run hacia la red privada.
+
+```hcl
+resource "google_vpc_access_connector" "redis" {
+  name          = "oms-${var.env}-connector"
+  region        = var.region
+  subnet { name = var.connector_subnet_id }
+  min_instances = 2
+  max_instances = 3
+}
+```
+
+Conectado en el `template` de Cloud Run con `vpc_access { connector = ..., egress = "ALL_TRAFFIC" }` — se eligió `ALL_TRAFFIC` (todo el tráfico saliente pasa por el connector) en vez de solo el tráfico a rangos privados, porque la salida general a internet ya la resuelve el Cloud NAT del módulo `network` sobre la misma VPC, así que no hay conflicto ni duplicidad.
+
+Nueva variable de entrada `connector_subnet_id`, conectada desde `terraform/main.tf`: `connector_subnet_id = module.network.connector_subnet_id`.
+
+**TODO 3 · Certificado SSL managed + Target HTTPS Proxy + Global Forwarding Rule.**
+
+Cadena completa de un HTTPS Load Balancer en GCP (6 piezas): NEG → Backend Service → URL Map (las 3 primeras ya existían) → **Certificado SSL → Target HTTPS Proxy → Global Forwarding Rule** (las 3 que faltaban).
+
+**Decisión de diseño discutida con el usuario — dominio placeholder:** un certificado SSL managed de Google requiere un dominio real con un registro DNS tipo A apuntando a la IP del Load Balancer, para que Google pueda validarlo y emitirlo. Un dominio es un recurso que se compra por separado a un registrador (Namecheap, Cloudflare, etc., ~$10-15 USD/año) — **no lo provee ni lo cubre el crédito de GCP**, es una industria completamente distinta del propio Google Cloud. Se decidió usar un placeholder explícito (`PENDIENTE-DOMINIO-REAL.example.com`) mientras no exista un dominio real:
+
+- El certificado SÍ se crea con el `apply`, pero queda en estado `PROVISIONING` indefinidamente (nunca falla el apply, simplemente nunca llega a `ACTIVE`).
+- La IP pública del Load Balancer (`lb_ip`) sí se crea y es real, verificable en la consola.
+- **Cloud Run sigue siendo completamente funcional y probable mientras tanto** por su propia URL nativa (`https://oms-<env>-xxxxx.a.run.app`), que ya trae HTTPS válido de fábrica sin necesitar ningún dominio propio — es la vía normal para validar la aplicación en staging antes de tener un dominio.
+- Solo queda sin poder probarse end-to-end la capa de "acceso por IP fija + HTTPS del Load Balancer" hasta que exista un dominio real.
+
+```hcl
+resource "google_compute_managed_ssl_certificate" "default" {
+  name = "oms-${var.env}-cert"
+  managed { domains = [var.lb_domain] }
+}
+resource "google_compute_target_https_proxy" "default" {
+  name             = "oms-${var.env}-https-proxy"
+  url_map          = google_compute_url_map.default.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.default.id]
+}
+resource "google_compute_global_forwarding_rule" "https" {
+  name                  = "oms-${var.env}-https-fr"
+  ip_address            = google_compute_global_address.lb_ip.address
+  port_range            = "443"
+  target                = google_compute_target_https_proxy.default.id
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+}
+```
+
+Nueva variable `lb_domain` (con `default = "PENDIENTE-DOMINIO-REAL.example.com"`), agregada también en `terraform/variables.tf` y conectada en `terraform/main.tf` para poder sobreescribirla desde un `.tfvars` el día que exista un dominio real, sin tocar el módulo.
+
+**Validación ejecutada (módulo aislado):**
+
+```bash
+cd oms-platform/terraform/modules/compute
+terraform init -backend=false
+terraform validate
+```
+
+Resultado: `Success! The configuration is valid.`
+
+**Estado:** ✅ hecho — 2026-09-21.
+
+---
+
+### 2.2 · Módulo `iam` — resolución del TODO de roles mínimos + aclaración de un valor no evidente
+
+**TODO · Roles del Service Account de CI/CD.**
+
+El pipeline (Fase 6) hace 3 cosas: construir/subir la imagen Docker, desplegar en Cloud Run vía Ansible, y leer estado de Cloud Run para el traffic-splitting/verificación (los comandos `gcloud run services describe` / `revisions list` que ya usa el role `oms_cloud_run`). Se agregó un cuarto rol a los 3 ya presentes:
+
+```hcl
+locals {
+  cicd_roles = [
+    "roles/run.developer",            # ya existía: desplegar/gestionar Cloud Run
+    "roles/iam.serviceAccountUser",   # ya existía: usar el SA de runtime al desplegar
+    "roles/artifactregistry.writer",  # ya existía: docker push
+    "roles/artifactregistry.reader",  # AGREGADO: Cloud Run necesita LEER la imagen al
+                                       # desplegar — más correcto declararlo explícito
+                                       # que asumir que "writer" ya cubre lectura.
+  ]
+}
+```
+
+Ningún rol amplio (`owner`/`editor`) — ninguno de los 3 pasos del pipeline necesita crear/modificar infraestructura (eso lo hace Terraform, con la autenticación humana del desarrollador).
+
+**Hallazgo de revisión — `allowed_audiences = ["sts.amazonaws.com"]` no es un error.** Al revisar el código ya existente, este valor llamó la atención por ser un dominio de AWS dentro de un módulo de GCP. Se confirmó (contra la documentación oficial de Google para WIF + GitHub Actions) que es correcto: es el "audience" por defecto que GitHub Actions incluye en sus tokens OIDC cuando no se especifica uno distinto (valor histórico de GitHub, su primer caso de uso documentado fue con AWS) — funciona igual para cualquier proveedor receptor, incluido GCP, siempre que ese proveedor lo declare como audiencia aceptada, que es justo lo que hace esa línea. Se agregó un comentario aclaratorio en el código para que no genere la misma duda a futuro.
+
+**Validación ejecutada (módulo aislado):** `Success! The configuration is valid.`
+
+**Estado:** ✅ hecho — 2026-09-21.
+
+---
+
+### 2.3 · Validación conjunta de los 4 módulos desde la raíz
+
+```bash
+cd oms-platform/terraform
+terraform validate
+```
+
+Resultado: **`Success! The configuration is valid.`** — Los 4 módulos (`network`, `database`, `compute`, `iam`) son ahora sintáctica y referencialmente correctos entre sí. Es la primera vez en el proyecto que la validación completa pasa sin ningún error (en la Fase 1 siempre había errores pendientes en `compute`).
+
+**Siguiente paso:** `terraform plan` completo (sin `-target`) contra staging, y de ser limpio, `terraform apply` completo.
 
 **Estado:** ✅ verificación por API hecha — 2026-09-21. Verificación visual en consola: pendiente de confirmación del usuario.

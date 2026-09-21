@@ -97,6 +97,8 @@ module "compute" {
   db_connection_name      = module.database.db_connection_name
   db_secret_id            = module.database.db_password_secret_id
   redis_host              = module.database.redis_host
+  connector_subnet_id     = module.network.connector_subnet_id
+  lb_domain               = var.lb_domain
   labels                  = local.common_labels
 }
 

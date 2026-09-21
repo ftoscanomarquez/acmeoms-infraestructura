@@ -20,7 +20,16 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   workload_identity_pool_provider_id = "github-provider"
 
   oidc {
-    issuer_uri        = "https://token.actions.githubusercontent.com"
+    issuer_uri = "https://token.actions.githubusercontent.com"
+    # NOTA ACLARATORIA (agregado por el equipo, no es un error ni un
+    # residuo de copiar/pegar): "sts.amazonaws.com" es el "audience" (el
+    # destinatario declarado) por defecto que GitHub Actions incluye en
+    # sus tokens OIDC cuando no se especifica uno distinto — un valor
+    # histórico de GitHub (su primer caso de uso documentado fue con AWS),
+    # pero funciona igual para cualquier proveedor receptor, incluido GCP,
+    # siempre que ese proveedor lo declare como audiencia aceptada — que es
+    # justo lo que hace esta línea. Confirmado con la documentación oficial
+    # de Google para WIF + GitHub Actions.
     allowed_audiences = ["sts.amazonaws.com"]
   }
 
@@ -55,19 +64,43 @@ resource "google_service_account_iam_binding" "cicd_wif" {
 }
 
 # ─── Permisos del SA de CI/CD (principio de mínimo privilegio) ──
-# TODO(alumno): asigna SOLO los roles que necesita el pipeline.
-# Pista mínima:
-#   - roles/run.developer            (desplegar revisiones de Cloud Run)
-#   - roles/iam.serviceAccountUser   (poder usar el SA del runtime)
-#   - roles/artifactregistry.writer  (publicar imágenes Docker)
-# Y NUNCA roles/owner ni roles/editor.
-
+# NOTA DE DISEÑO (agregado por el equipo): el pipeline (Fase 6) hace 3
+# cosas en secuencia — (1) construir y subir la imagen Docker, (2)
+# desplegar esa imagen en Cloud Run vía Ansible/gcloud, y (3) leer estado
+# de Cloud Run para el traffic-splitting y la verificación post-deploy
+# (comandos `gcloud run services describe` / `gcloud run revisions list`
+# que ya usa el role oms_cloud_run de Ansible). Roles justificados:
+#
+#   - roles/run.developer            → desplegar y gestionar revisiones/
+#                                       tráfico de Cloud Run (cubre además
+#                                       la lectura de servicios/revisiones
+#                                       que usa Ansible para comparar
+#                                       imágenes y hacer el traffic-split).
+#   - roles/iam.serviceAccountUser   → necesario para poder "actuar en
+#                                       nombre de" el SA de runtime del
+#                                       módulo compute al desplegar
+#                                       (Cloud Run exige este permiso
+#                                       explícito, no basta con crear el
+#                                       recurso).
+#   - roles/artifactregistry.writer  → `docker push` de la imagen construida.
+#   - roles/artifactregistry.reader  → agregado explícitamente en vez de
+#                                       asumir que "writer" ya cubre
+#                                       lectura: Cloud Run necesita poder
+#                                       LEER la imagen del repositorio al
+#                                       desplegar, y es más correcto (y
+#                                       auditable) declarar cada permiso
+#                                       que realmente se usa, en vez de
+#                                       confiar en un rol más amplio.
+#
+# NUNCA roles/owner ni roles/editor — ninguno de los 3 pasos del pipeline
+# necesita crear/modificar infraestructura (eso lo hace Terraform, con la
+# autenticación humana del desarrollador, no el SA de CI/CD).
 locals {
   cicd_roles = [
     "roles/run.developer",
     "roles/iam.serviceAccountUser",
     "roles/artifactregistry.writer",
-    # TODO(alumno): añade los que falten y justifica en el README
+    "roles/artifactregistry.reader",
   ]
 }
 

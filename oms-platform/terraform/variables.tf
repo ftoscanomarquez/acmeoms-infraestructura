@@ -89,3 +89,15 @@ variable "github_repository" {
   description = "Repo GitHub que puede impersonar el SA vía WIF (formato owner/repo)."
   default     = "acme-org/oms-platform"
 }
+
+# Agregado por el equipo (Fase 2): dominio para el certificado SSL managed
+# del Load Balancer. Requiere un dominio real registrado (no lo cubre GCP)
+# con un registro DNS tipo A hacia la IP del Load Balancer — ver
+# BITACORA-COMANDOS.md Fase 2 para el detalle completo de esta decisión.
+# Mientras no exista un dominio real, el certificado se crea igual pero
+# queda en estado "PROVISIONING" sin bloquear el resto del despliegue.
+variable "lb_domain" {
+  type        = string
+  description = "Dominio para el certificado SSL managed del Load Balancer (requiere DNS real apuntando a la IP del LB)."
+  default     = "PENDIENTE-DOMINIO-REAL.example.com"
+}
