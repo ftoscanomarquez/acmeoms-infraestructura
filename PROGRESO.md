@@ -107,7 +107,7 @@
 - [ ] `OBSERVABILIDAD.md`
 - [ ] `CERTIFICADOS.md` (evaluar si aplica tal cual lo define toscaprompt, dado que aquí el TLS lo gestiona el Load Balancer de GCP, no Traefik/mkcert)
 - [ ] `DEPLOYMENT.md`
-- [ ] `DIAGRAMAS.md`
+- [x] `DIAGRAMAS.md` — adelantado durante la Fase 3, a petición del usuario: diagrama Mermaid de relación entre los 38 recursos aplicados, tabla resumen por módulo y glosario completo de términos. Documento vivo — se amplía en cada fase futura (Ansible, CI/CD, bonus)
 - [ ] `RETROSPECTIVA.md`
 - [ ] Verificación final de los 7 comandos del enunciado (sección 4)
 - [ ] Decidir si se destruye la infraestructura (`terraform destroy` + limpieza) para no agotar crédito, dejando todo documentado para reconstruir
