@@ -616,4 +616,74 @@ Success! The configuration is valid.
 
 Se usó `-backend=false` porque en este punto solo interesa validar sintaxis/referencias del módulo por separado, no conectar a ningún backend remoto (eso se hace desde la raíz de `terraform/` en un paso posterior de esta misma fase). Los artefactos temporales de esta validación (`.terraform/`, `.terraform.lock.hcl`) se borraron después, para no dejar residuos fuera de lugar en el repo.
 
-**Estado:** ✅ hecho — 2026-09-21. Módulo `network` completo y validado. Pendiente: validar junto con el resto de módulos desde la raíz de `terraform/` (requiere primero configurar el backend `gcs`, ver Fase 0 § 0.7).
+**Estado:** ✅ hecho — 2026-09-21. Módulo `network` completo y validado.
+
+---
+
+### 1.2 · Módulo `database` — resolución de los 2 TODOs (password segura + database_flags)
+
+**Contexto:** `oms-platform/terraform/modules/database/main.tf` traía 2 TODOs, uno de ellos crítico de seguridad: la línea `password = "TODO_USA_SECRET_MANAGER_NO_TEXTO_PLANO"` — un placeholder de texto plano que, si se hubiera dejado así y llegado a un `apply`, habría escrito una contraseña insegura y predecible en la base de datos real, además de ser exactamente el tipo de hallazgo que el enunciado penaliza con −20 pts si `gitleaks` lo detecta en el repo.
+
+**TODO 1 · Password del usuario `oms_app` — opción elegida: `random_password` + Secret Manager.**
+
+El enunciado ofrecía dos caminos válidos: (A) generar la password con el provider `random` y guardarla en Secret Manager, con control total para rotarla manualmente; o (B) dejar que Cloud SQL gestione la password internamente (`manage_master_user_password`), sin que ni Terraform llegue a conocer el valor en ningún momento — más estricto pero menos documentado/estándar. Se eligió la opción (A) por ser el patrón más común para Terraform + Cloud SQL y dar más control operativo.
+
+Cadena de recursos implementada:
+
+```hcl
+resource "random_password" "db_password" {
+  length            = 32
+  special           = true
+  override_special  = "!#$%&*()-_=+[]{}<>:?"   # conjunto seguro, evita caracteres problemáticos al pasar por CLI/API
+}
+
+resource "google_secret_manager_secret" "db_password" { ... }   # ya existía: solo el CONTENEDOR del secreto
+
+# Agregado: la VERSIÓN del secreto con el valor real generado
+resource "google_secret_manager_secret_version" "db_password" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = random_password.db_password.result
+}
+
+resource "google_sql_user" "oms" {
+  name     = "oms_app"
+  instance = google_sql_database_instance.main.name
+  password = random_password.db_password.result   # antes: texto plano hardcodeado
+}
+```
+
+Puntos clave documentados en el código: (1) `google_secret_manager_secret` solo crea el contenedor vacío — sin `google_secret_manager_secret_version` el secreto existiría pero sin ningún valor dentro; (2) la password nunca se escribe como texto literal en ningún punto — se genera en el momento del `apply` y se referencia por nombre de recurso; (3) el valor sí queda dentro del `tfstate` (inherente a cómo funciona Terraform), protegido por los permisos del bucket de estado creado en la Fase 0, pero nunca aparece en el historial de git.
+
+**TODO 2 · `database_flags` para logging mínimo.**
+
+Son el equivalente gestionado de editar `postgresql.conf` a mano (Cloud SQL no da acceso al sistema de archivos del servidor). Se agregaron 3 flags:
+
+| Flag | Valor | Por qué |
+|---|---|---|
+| `log_min_duration_statement` | `400` | Registra cualquier consulta que tarde más de 400ms — mismo umbral que exige NFR-PERF-002 para `POST /api/orders` p95. Permite identificar qué consulta concreta causa una latencia alta |
+| `log_statement` | `ddl` | Registra solo cambios de estructura (CREATE/ALTER/DROP TABLE) — auditoría de esquema sin inflar el log con tráfico normal de SELECT/INSERT |
+| `log_connections` | `on` | Registra cada nueva conexión — apoya el audit trail que exige REG-GDPR-003 |
+
+**Validación ejecutada (módulo aislado):**
+
+```bash
+cd oms-platform/terraform/modules/database
+terraform init -backend=false
+terraform validate
+```
+
+Resultado: `Success! The configuration is valid.` (también descargó el provider `hashicorp/random` por primera vez, confirmando que la referencia declarada en `versions.tf` funciona).
+
+**Validación conjunta ejecutada (raíz de `terraform/`, los 4 módulos a la vez, sin backend):**
+
+```bash
+cd oms-platform/terraform
+terraform init -backend=false
+terraform validate
+```
+
+Resultado: **`network` y `database` no arrojaron ningún error** — las referencias cruzadas entre ambos módulos (`module.network.network_id`, `module.network.private_subnet_id` consumidos por `database`) son correctas. Sí aparecieron 2 errores esperados en el módulo `compute` (`cdn_policy` incompleto, `Missing required argument`), porque ese módulo todavía tiene sus TODOs sin resolver — se abordará en la Fase 2. Esto confirma que la validación conjunta funciona correctamente (detecta problemas reales cuando existen, no solo "pasa siempre"), y que hasta ahora `network`+`database` están libres de errores de integración entre sí.
+
+Artefactos temporales (`.terraform/`, `.terraform.lock.hcl`) borrados tras cada validación, tanto en los módulos aislados como en la raíz.
+
+**Estado:** ✅ hecho — 2026-09-21. Módulo `database` completo y validado, sin conflictos con `network`. Pendiente: módulos `compute` e `iam` (Fase 2).

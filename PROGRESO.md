@@ -8,9 +8,9 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 1 — Terraform: red y datos (1er punto completo, 5 restantes)
-**Último hito completado:** Módulo `network` completo — resueltos los 3 TODOs (subredes multi-zona reinterpretadas como segmentación por propósito con una subred `connector` nueva, Cloud NAT con router, y 3 reglas de firewall explícitas) con `terraform validate` exitoso. Ver `oms-platform/BITACORA-COMANDOS.md` § Fase 1 para el detalle técnico completo (incluye toda la teoría de redes explicada: CIDR, máscaras, VLSM, NAT, IAP, health checks).
-**Siguiente paso concreto:** `terraform validate` + `terraform plan` del módulo `network` ya integrado en la configuración raíz (`terraform/main.tf`) — para esto falta primero descomentar/completar el backend `gcs`. Después: completar el módulo `database` (password vía Secret Manager, database_flags).
+**Fase en curso:** Fase 1 — Terraform: red y datos (3 de 6 puntos completos)
+**Último hito completado:** Módulos `network` y `database` completos y validados — juntos, sin conflictos entre sí (`terraform validate` conjunto desde la raíz solo mostró errores en `compute`, que aún no se toca, confirmando que `network`+`database` están correctos). En `database` se resolvió el TODO crítico de seguridad (password en texto plano → generada con `random_password` + guardada en Secret Manager) y se agregaron 3 `database_flags` de logging. Ver `oms-platform/BITACORA-COMANDOS.md` § Fase 1 para el detalle técnico completo.
+**Siguiente paso concreto:** Configurar el backend `gcs` real en `terraform/main.tf` (descomentar y completar con el bucket de staging), ejecutar el primer `terraform init` con backend real + `terraform plan -var-file=envs/staging.tfvars`, y evaluar si hace falta completar algo de `compute`/`iam` antes o si el plan ya puede limitarse a `network`+`database`.
 
 ---
 
@@ -49,9 +49,9 @@
 ### Fase 1 — Terraform: red y datos
 
 - [x] Completar módulo `network` (subredes multi-zona → reinterpretado como segmentación por propósito con subred `connector`; Cloud NAT; 3 reglas de firewall) — `terraform validate` exitoso en aislado
-- [ ] `terraform validate` + `terraform plan` del módulo network (integrado en la raíz, requiere backend gcs configurado)
-- [ ] Completar módulo `database` (password vía Secret Manager, database_flags)
-- [ ] `terraform plan` con network + database
+- [x] `terraform validate` de network + database juntos desde la raíz (sin backend) → sin errores entre ambos (los únicos errores son en `compute`, pendiente de Fase 2)
+- [x] Completar módulo `database` (password vía `random_password` + Secret Manager — ya no texto plano; 3 `database_flags` de logging)
+- [ ] `terraform plan` con network + database (requiere backend gcs configurado y un `.tfvars`)
 - [ ] Primer `terraform apply` real a staging (network + database)
 - [ ] Verificar recursos creados en consola GCP
 

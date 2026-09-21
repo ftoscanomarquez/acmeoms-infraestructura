@@ -12,6 +12,24 @@ variable "deletion_protection" { type = bool }
 variable "labels"              { type = map(string) }
 
 # ─── Password aleatoria gestionada por GCP en Secret Manager ──────
+#
+# NOTA DE DISEÑO (agregado por el equipo): el recurso `google_secret_manager_secret`
+# de abajo solo crea el CONTENEDOR del secreto (como una carpeta vacía) —
+# todavía no tiene ningún valor dentro. El valor real se genera con
+# `random_password` (provider "random", ya declarado en versions.tf) y se
+# guarda dentro del contenedor con `google_secret_manager_secret_version`.
+# Terraform nunca escribe la contraseña como texto literal en ningún punto
+# del código: la genera él mismo en el momento del `apply` y la encadena
+# entre recursos por referencia (`random_password.db_password.result`).
+resource "random_password" "db_password" {
+  length  = 32
+  special = true
+  # Cloud SQL Postgres rechaza algunos caracteres especiales en la
+  # password si se pasan por CLI/API sin escapar correctamente; se
+  # restringe el conjunto a uno seguro y ampliamente soportado.
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
 resource "google_secret_manager_secret" "db_password" {
   secret_id = "oms-${var.env}-db-password"
   replication {
@@ -22,6 +40,13 @@ resource "google_secret_manager_secret" "db_password" {
     }
   }
   labels = var.labels
+}
+
+# Agregado por el equipo: crea la VERSIÓN del secreto con el valor generado
+# por random_password. Sin esto, el secreto existiría pero estaría vacío.
+resource "google_secret_manager_secret_version" "db_password" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = random_password.db_password.result
 }
 
 # ─── Cloud SQL PostgreSQL ─────────────────────────────────────────
@@ -58,8 +83,32 @@ resource "google_sql_database_instance" "main" {
       private_network = var.network_id
     }
 
-    # TODO(alumno): añade database_flags para logging mínimo
-    # (log_min_duration_statement, log_statement = 'ddl', etc.)
+    # NOTA DE DISEÑO (agregado por el equipo): "database_flags" son el
+    # equivalente gestionado de editar postgresql.conf a mano — Cloud SQL
+    # no da acceso directo al sistema de archivos del servidor, así que
+    # estos parámetros de configuración se ajustan aquí.
+    database_flags {
+      name  = "log_min_duration_statement"
+      # Registra en el log cualquier consulta que tarde más de 400ms —
+      # el mismo umbral que NFR-PERF-002 exige para POST /api/orders p95.
+      # Sin esto, sería imposible saber QUÉ consulta concreta está
+      # causando una latencia alta si el sistema empieza a responder mal.
+      value = "400"
+    }
+    database_flags {
+      name = "log_statement"
+      # 'ddl' registra solo cambios de ESTRUCTURA (CREATE/ALTER/DROP TABLE),
+      # no las consultas normales de datos — es una medida de auditoría de
+      # cambios de esquema (quién y cuándo), no de tráfico general, así que
+      # no infla el volumen de logs con cada SELECT/INSERT normal.
+      value = "ddl"
+    }
+    database_flags {
+      name = "log_connections"
+      # Registra cada nueva conexión a la base de datos — apoya la
+      # trazabilidad de accesos que exige REG-GDPR-003 (audit trail).
+      value = "on"
+    }
 
     # TODO(alumno) [BONUS CMEK]: añade encryption_key_name apuntando a una CMEK propia
     # en lugar de la clave gestionada por Google.
@@ -79,13 +128,22 @@ resource "google_sql_database" "oms" {
 }
 
 # ─── Usuario de aplicación con password gestionada ────────────────
-# Cloud SQL puede generar y rotar la password automáticamente.
+#
+# NOTA DE DISEÑO (agregado por el equipo): se eligió la opción
+# random_password + Secret Manager (frente a "password_policy" con
+# manage_master_user_password, donde ni Terraform vería la password) por
+# dar más control operativo para rotarla manualmente si hace falta, siendo
+# el patrón más estándar y documentado para Terraform + Cloud SQL.
+#
+# El valor jamás aparece como texto literal: se referencia directamente
+# desde el recurso `random_password` de arriba. Terraform sí conoce el
+# valor internamente (queda en el tfstate, protegido por los permisos del
+# bucket gs://acmeoms-<env>-fatm-tfstate creado en la Fase 0), pero nunca
+# se escribe a mano ni aparece en el historial de git.
 resource "google_sql_user" "oms" {
   name     = "oms_app"
   instance = google_sql_database_instance.main.name
-  # TODO(alumno): elige entre 'password' (con random_password + secret) o
-  # 'password_policy' con manage_master_user_password (Cloud SQL la gestiona).
-  password = "TODO_USA_SECRET_MANAGER_NO_TEXTO_PLANO"
+  password = random_password.db_password.result
 }
 
 # ─── Memorystore Redis Standard (HA) ──────────────────────────────
