@@ -7,12 +7,30 @@ variable "project_id" {
 
 variable "region" {
   type        = string
-  description = "Región principal. REG-GDPR-001 limita a regiones europeas."
+  description = "Región principal. REG-GDPR-001 limita a regiones dentro de la UE."
   default     = "europe-west3"
   validation {
-    # TODO(alumno): añade una validación que prohíba regiones fuera de la UE.
-    condition     = startswith(var.region, "europe-")
-    error_message = "REG-GDPR-001 exige una región europea (europe-*)."
+    # NOTA DE DISEÑO (agregado por el equipo): `startswith(var.region, "europe-")`
+    # NO es suficiente — GCP tiene regiones que empiezan literalmente con
+    # "europe-" pero NO están dentro de la Unión Europea: europe-west2
+    # (Londres, Reino Unido — fuera de la UE tras el Brexit) y europe-west6
+    # (Zúrich, Suiza — nunca fue miembro de la UE). Aceptar cualquiera de
+    # esas dos violaría REG-GDPR-001, que exige residencia de datos en la
+    # UE, no solo "en Europa geográfica". Se usa una allowlist explícita
+    # con las regiones GCP que sí están dentro de la UE (mismo patrón que
+    # la validación de `env` de abajo).
+    condition = contains([
+      "europe-west1",    # Bélgica
+      "europe-west3",    # Alemania (Frankfurt) — región primaria del proyecto
+      "europe-west4",    # Países Bajos
+      "europe-west8",    # Italia (Milán)
+      "europe-west9",    # Francia (París)
+      "europe-west12",   # Italia (Turín)
+      "europe-southwest1", # España (Madrid)
+      "europe-north1",   # Finlandia
+      "europe-central2", # Polonia (Varsovia) — región DR del bonus multi-region
+    ], var.region)
+    error_message = "REG-GDPR-001 exige una región dentro de la UE (europe-west1/3/4/8/9/12, europe-southwest1, europe-north1 o europe-central2) — no basta con que el nombre empiece por 'europe-' (europe-west2/Londres y europe-west6/Zúrich están fuera de la UE)."
   }
 }
 

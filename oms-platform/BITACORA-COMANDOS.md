@@ -687,3 +687,304 @@ Resultado: **`network` y `database` no arrojaron ningún error** — las referen
 Artefactos temporales (`.terraform/`, `.terraform.lock.hcl`) borrados tras cada validación, tanto en los módulos aislados como en la raíz.
 
 **Estado:** ✅ hecho — 2026-09-21. Módulo `database` completo y validado, sin conflictos con `network`. Pendiente: módulos `compute` e `iam` (Fase 2).
+
+---
+
+### 1.3 · Configurar el backend `gcs` real en `terraform/main.tf`
+
+**Contexto:** `terraform/main.tf` traía el bloque de backend comentado, con una advertencia explícita: *"El backend NO puede usar variables — tienes que parametrizar con `terraform init -backend-config`"*. Esto tiene una razón técnica: el bloque `backend { ... }` se procesa en el primer paso de `terraform init`, ANTES de que Terraform lea `var.env` o cualquier `.tfvars` — por eso no admite interpolación (`${var.env}` ahí sería un error de sintaxis).
+
+**Solución implementada:**
+
+1. Se descomentó/completó el bloque, dejándolo **vacío de valores concretos** (solo declara el tipo de backend):
+
+```hcl
+terraform {
+  backend "gcs" {}
+}
+```
+
+2. Se crearon dos archivos de configuración de backend, uno por entorno, para no tener que escribir el `-backend-config` completo a mano cada vez:
+
+`oms-platform/terraform/envs/staging.backend.hcl`:
+```hcl
+bucket = "acmeoms-staging-fatm-tfstate"
+prefix = "oms-platform/staging"
+```
+
+`oms-platform/terraform/envs/production.backend.hcl`:
+```hcl
+bucket = "acmeoms-production-fatm-tfstate"
+prefix = "oms-platform/production"
+```
+
+(Referencian los buckets ya creados en la Fase 0 § 0.7 — ninguno contiene secretos, solo el nombre del bucket y la ruta de prefijo.)
+
+**Comando ejecutado (staging):**
+
+```bash
+cd oms-platform/terraform
+terraform init -backend-config=envs/staging.backend.hcl
+```
+
+**Resultado obtenido:**
+```
+Initializing the backend...
+Successfully configured the backend "gcs"!
+...
+Terraform has been successfully initialized!
+```
+
+**Verificación independiente en GCP** (confirmar que el backend realmente escribió algo en el bucket, no solo que el comando "no dio error"):
+
+```bash
+gcloud storage ls gs://acmeoms-staging-fatm-tfstate/ --recursive
+```
+
+Resultado:
+```
+gs://acmeoms-staging-fatm-tfstate/oms-platform/staging/default.tfstate
+```
+
+Confirmado: el archivo de estado ya existe en la ruta exacta configurada (`prefix = "oms-platform/staging"`). Para producción, el mismo flujo con `-backend-config=envs/production.backend.hcl` apuntaría al bucket `acmeoms-production-fatm-tfstate` (no ejecutado todavía en esta sesión, se hará en la Fase 5).
+
+**Hallazgo/corrección — `.gitignore` casi vacío:** al revisar qué archivos generaba `terraform init` localmente (carpeta `.terraform/`, con providers descargados y un `terraform.tfstate` local que es solo un PUNTERO al backend remoto, no el estado real de infraestructura), se detectó que el `.gitignore` del repo solo excluía `.DS_Store`. Se agregaron las exclusiones estándar de Terraform, Ansible y Python:
+
+```gitignore
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.retry
+.ansible/
+__pycache__/
+*.pyc
+```
+
+Nota importante: **`.terraform.lock.hcl` NO se ignora** — ese archivo sí debe versionarse (fija las versiones exactas de providers para reproducibilidad; es el propio Terraform quien recomienda incluirlo en el control de versiones). Solo se ignora la carpeta `.terraform/` completa (los binarios descargados), no el archivo de lock que vive junto a ella. Los `.tfvars` de `envs/` tampoco se ignoran a propósito — no contienen secretos (solo `project_id`, tier, etc.) y deben quedar versionados según exige el enunciado.
+
+**Estado:** ✅ hecho — 2026-09-21 (staging). Producción pendiente para la Fase 5.
+
+---
+
+### 1.4 · Completar `variables.tf` y `envs/*.tfvars`; primer `terraform plan` dirigido a staging
+
+**Contexto:** para poder ejecutar un `terraform plan` real (aunque sea dirigido solo a `network`+`database`), hacían falta dos cosas más: (1) resolver el TODO de validación de región en `terraform/variables.tf`, y (2) reemplazar los placeholders `TODO-...` de `envs/staging.tfvars` y `envs/production.tfvars` con valores reales.
+
+**TODO de `variables.tf` — validación de región insuficiente.**
+
+La condición original `startswith(var.region, "europe-")` no bastaba: GCP tiene regiones que empiezan literalmente con `"europe-"` pero NO están dentro de la Unión Europea — `europe-west2` (Londres, Reino Unido, fuera de la UE tras el Brexit) y `europe-west6` (Zúrich, Suiza, nunca fue miembro de la UE). Aceptar cualquiera de esas dos violaría REG-GDPR-001 (residencia de datos en la UE, no solo "Europa geográfica"). Se reemplazó por una allowlist explícita de regiones GCP que sí están en la UE (mismo patrón que la validación de `env`): `europe-west1/3/4/8/9/12`, `europe-southwest1`, `europe-north1`, `europe-central2`.
+
+**`envs/staging.tfvars` y `envs/production.tfvars` — placeholders reemplazados:**
+
+| Variable | Antes | Ahora |
+|---|---|---|
+| `project_id` (staging) | `TODO-acme-oms-staging` | `acmeoms-staging-fatm` |
+| `project_id` (production) | `TODO-acme-oms-production` | `acmeoms-production-fatm` |
+| `github_repository` (ambos) | `TODO-org/oms-platform` | `ftoscanomarquez/acmeoms-infraestructura` |
+| `image_repo` (ambos) | `.../TODO-project/oms` | `europe-west3-docker.pkg.dev/<project_id-real>/oms` |
+| `image_sha` (ambos) | `sha256:TODO_...` | placeholder explícito con nota "PENDIENTE_FASE_3/5" — no se puede completar de verdad hasta construir la imagen Docker |
+
+**Hallazgo — `-target` no evita que Terraform parsee TODA la configuración.**
+
+Primer intento de plan dirigido:
+
+```bash
+terraform plan -var-file=envs/staging.tfvars -target=module.network -target=module.database
+```
+
+Resultado: **falló** con el mismo error de sintaxis en `compute` que ya habíamos visto en la validación conjunta (§ 1.2) — `cdn_policy` sin `cache_key_policy` ni `signed_url_cache_max_age_sec`. Esto reveló algo importante sobre cómo funciona `-target`: **limita qué recursos se van a crear/modificar, pero Terraform necesita parsear y validar la sintaxis de TODO el archivo de configuración primero**, porque `main.tf` conecta los 4 módulos entre sí en un único grafo de dependencias (`module.compute` referencia `module.database.db_connection_name`, `module.iam` referencia `module.compute.cloud_run_service_account`) — no puede "saltarse" la lectura de un módulo aunque luego no vaya a aplicarlo.
+
+**Decisión:** en vez de adelantar toda la Fase 2, se corrigió ÚNICAMENTE el error puntual de sintaxis en `cdn_policy` (agregando el `cache_key_policy` mínimo obligatorio), dejando el resto del diseño de la política de CDN para la Fase 2 / bonus "Cloud CDN políticas finas":
+
+```hcl
+cdn_policy {
+  cache_mode        = "CACHE_ALL_STATIC"
+  default_ttl       = 3600
+  max_ttl           = 86400
+  negative_caching  = true
+  serve_while_stale = 86400
+
+  cache_key_policy {
+    include_host         = true
+    include_protocol     = true
+    include_query_string = false   # provisional: se afinará en la Fase 2/bonus
+  }
+}
+```
+
+**Segundo intento del plan — exitoso:**
+
+```bash
+terraform plan -var-file=envs/staging.tfvars -target=module.network -target=module.database
+```
+
+Resultado:
+```
+Plan: 17 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + db_connection_name = (known after apply)
+  + redis_host         = (known after apply)
+```
+
+Los 17 recursos coinciden exactamente con lo diseñado: VPC, 2 subredes (`private`, `connector`), router + Cloud NAT, 3 reglas de firewall, la conexión de peering privado para Cloud SQL, la instancia de Cloud SQL, la base de datos `oms`, el usuario `oms_app`, la password aleatoria, el secreto y su versión, y la instancia de Redis. 0 cambios inesperados, 0 destrucciones — coherente con que nada de esto existe todavía en el proyecto `acmeoms-staging-fatm`.
+
+Apareció el warning esperado y benigno de Terraform: *"Resource targeting is in effect... The -target option is not for routine use"* — es el recordatorio estándar de que `-target` es para casos excepcionales; se usa aquí deliberadamente por la decisión ya documentada (cerrar la Fase 1 sin adelantar la Fase 2 completa).
+
+---
+
+### 1.5 · Preguntas de gestión antes del `apply`: destrucción y aplicación incremental
+
+Antes de ejecutar el `apply` real, se aclararon dos dudas operativas del usuario:
+
+**¿Cómo se destruye esto después?** Con `terraform destroy -var-file=envs/staging.tfvars` — borra exactamente los recursos que Terraform tiene registrados en su `tfstate`. Importante: `google_sql_database_instance.main` tiene `deletion_protection = true` y `lifecycle { prevent_destroy = true }` (protecciones ya presentes en el código original, exigidas por el enunciado) — un `destroy` normal **fallará a propósito** contra esa instancia como salvaguarda. Para destruir de verdad al cerrar el proyecto (Fase 8), habrá que desactivar esas protecciones explícitamente primero.
+
+**¿Se puede aplicar "lo que falta" después sin re-crear lo ya aplicado?** Sí — es el comportamiento normal de Terraform. Cuando más adelante se complete `compute`/`iam` (Fase 2) y se ejecute un `apply` sin `-target` (todo el proyecto), Terraform compara el estado real actual (lo que ya existe: `network`+`database`, creados ahora) contra el código completo, y **solo crea lo que todavía no existe** — no vuelve a tocar ni recrea lo que ya está aplicado. Ese es el propósito central del archivo de estado remoto configurado en la Fase 0/1.3.
+
+**Comando ejecutado (apply real contra staging):**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -target=module.network -target=module.database -auto-approve
+```
+
+**Resultado — falló parcialmente (exit code 1), con un hallazgo claro de causa raíz.**
+
+Recursos creados EXITOSAMENTE antes del fallo: `random_password`, `google_secret_manager_secret` + su versión, la VPC completa (`oms-staging-vpc`), ambas subredes (`private`, `connector`), el router, Cloud NAT, las 3 reglas de firewall, y el rango de direcciones reservado para el peering (`private_service_range`) — 12 de los 17 recursos planeados.
+
+**3 recursos fallaron, todos por la MISMA causa raíz:**
+
+```
+Error: googleapi: Error 403: Service Networking API has not been used in project 668851924327
+before or it is disabled... service: "servicenetworking.googleapis.com"
+  with module.network.google_service_networking_connection.private_vpc_connection
+
+Error: Error, failed to create instance oms-staging-postgres: ...SERVICE_NETWORKING_NOT_ENABLED
+  with module.database.google_sql_database_instance.main
+
+Error: ...Google private service access is not enabled...
+  with module.database.google_redis_instance.cache
+```
+
+**Diagnóstico:** la API **`servicenetworking.googleapis.com`** (Service Networking API) sustenta el mecanismo de Private Service Connect (`google_service_networking_connection`, el que conecta la VPC con la red interna de Google para que Cloud SQL/Redis tengan IP privada) — y **no se incluyó en la lista de 7 APIs habilitadas en la Fase 0 § 0.9**. Fue un descuido: en aquel momento se derivaron las APIs a partir de los recursos `google_*` "directos" de cada módulo, pero esta API de soporte no salta a la vista tan obviamente porque ningún recurso se llama literalmente "service networking" — solo aparece al usarla en tiempo de ejecución. Los otros dos errores (Cloud SQL y Redis) son consecuencias en cadena: ambos dependen de que `private_vpc_connection` exista primero.
+
+**Por qué esto no fue una pérdida de trabajo:** es la prueba práctica de por qué usar backend remoto con estado (Fase 1.3) importa — los 12 recursos que sí se crearon quedan registrados en el `tfstate`; al reintentar, Terraform no los vuelve a crear, solo reintenta los 3 que fallaron.
+
+**Corrección aplicada:**
+
+```bash
+gcloud services enable servicenetworking.googleapis.com --project=acmeoms-staging-fatm
+gcloud services enable servicenetworking.googleapis.com --project=acmeoms-production-fatm
+```
+
+(Se habilitó también en producción de una vez, para no repetir el mismo error cuando se llegue a la Fase 5.)
+
+**Reintento 1 del apply (tras habilitar Service Networking API):**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -target=module.network -target=module.database -auto-approve
+```
+
+Resultado: `Plan: 5 to add` (no 17 — confirma que Terraform reconoció los 12 recursos ya creados en el `tfstate` y solo reintentó los que faltaban). `private_vpc_connection` se creó exitosamente esta vez (tardó 1m2s). Pero **Cloud SQL y Redis volvieron a fallar**, con un error distinto y más revelador:
+
+```
+Error: Error, failed to create instance because the network doesn't have at least 1 private
+services connection. Please see https://cloud.google.com/sql/docs/mysql/private-ip#network_requirements
+  with module.database.google_sql_database_instance.main
+
+Error: ...Google private service access is not enabled...
+  with module.database.google_redis_instance.cache
+```
+
+**Diagnóstico — condición de carrera (race condition), no un problema de configuración ni de APIs.** El log mostraba `private_vpc_connection: Creating...`, `redis: Creating...` y `sql_database_instance: Creating...` lanzados los TRES al mismo tiempo. Aunque Cloud SQL y Redis dependen lógicamente de que el peering exista primero, en el código **no había ninguna dependencia explícita** entre esos recursos — `private_network = var.network_id` en Cloud SQL apunta a la VPC en sí, no a la conexión de peering, así que Terraform no tenía forma de saber que debía esperar. Sin `depends_on` explícito, Terraform paraleliza agresivamente todo lo que no tenga una referencia directa entre argumentos.
+
+**Corrección aplicada — `depends_on` explícito entre módulos:**
+
+1. Nuevo output en `modules/network/main.tf`: `private_vpc_connection_id`, exponiendo el ID de `google_service_networking_connection.private_vpc_connection`.
+2. Nueva variable de entrada en `modules/database/main.tf`: `private_vpc_connection_id` (usada ÚNICAMENTE para forzar el orden, no para ninguna configuración real).
+3. `depends_on = [var.private_vpc_connection_id]` agregado tanto en `google_sql_database_instance.main` como en `google_redis_instance.cache`.
+4. Conectado en `terraform/main.tf`: `private_vpc_connection_id = module.network.private_vpc_connection_id` al invocar `module "database"`.
+
+**Reintento 2 del apply — ÉXITO TOTAL:**
+
+```bash
+terraform apply -var-file=envs/staging.tfvars -target=module.network -target=module.database -auto-approve
+```
+
+`Plan: 4 to add` (ya no 5 — `private_vpc_connection` reconocido en el estado, sin cambios). Con el `depends_on` en efecto, Redis y Cloud SQL se crearon sin errores esta vez:
+
+```
+module.database.google_redis_instance.cache: Creation complete after 4m23s
+  [id=projects/acmeoms-staging-fatm/locations/europe-west3/instances/oms-staging-redis]
+module.database.google_sql_database_instance.main: Creation complete after 5m8s
+  [id=oms-staging-postgres]
+module.database.google_sql_user.oms: Creation complete after 1s
+module.database.google_sql_database.oms: Creation complete after 2s
+
+Apply complete! Resources: 4 added, 0 changed, 0 destroyed.
+
+Outputs:
+db_connection_name = "acmeoms-staging-fatm:europe-west3:oms-staging-postgres"
+redis_host = "10.152.126.148"
+```
+
+**Resumen del proceso completo de aplicación de la Fase 1 (los 17 recursos, en 3 tandas):**
+
+| Intento | Resultado | Recursos creados | Causa del fallo (si hubo) |
+|---|---|---|---|
+| 1 | Falló | 12/17 (VPC, subredes, NAT, firewall, secret) | Faltaba habilitar `servicenetworking.googleapis.com` |
+| 2 | Falló | +1/17 (`private_vpc_connection`) | Condición de carrera: Cloud SQL/Redis se lanzaron en paralelo sin `depends_on` |
+| 3 | ✅ Éxito | +4/17 (Redis, Cloud SQL, database, user) | — |
+
+**Lección clave para reproducir esto en el futuro:** en Terraform, una dependencia *lógica* entre recursos de módulos distintos (ej. "Cloud SQL necesita que el peering exista") **no se infiere automáticamente** salvo que haya una referencia directa de un atributo a otro. Si dos recursos no comparten un argumento que los conecte, hay que declarar `depends_on` explícitamente — de lo contrario Terraform los paraleliza agresivamente y pueden fallar por orden de creación, incluso si "deberían" funcionar en teoría.
+
+**Estado:** ✅ hecho — 2026-09-21. **Los 17 recursos de `network`+`database` existen realmente en el proyecto `acmeoms-staging-fatm`.**
+
+---
+
+### 1.6 · Verificación cruzada: API directa de GCP + consola visual
+
+**Contexto:** no basta con confiar en que Terraform reportó "Apply complete" — se verificó independientemente contra la API real de GCP (con comandos `gcloud ... list`, sin pasar por Terraform) y visualmente en la consola web.
+
+**Comandos ejecutados:**
+
+```bash
+gcloud sql instances list --project=acmeoms-staging-fatm --format='table(name,databaseVersion,region,state)'
+gcloud redis instances list --region=europe-west3 --project=acmeoms-staging-fatm --format='table(name,tier,state)'
+gcloud compute networks list --project=acmeoms-staging-fatm --format='table(name)'
+gcloud compute networks subnets list --project=acmeoms-staging-fatm --format='table(name,region,ipCidrRange)'
+```
+
+**Resultado — todo confirmado:**
+
+| Recurso | Confirmado por API |
+|---|---|
+| Cloud SQL | `oms-staging-postgres`, `POSTGRES_16`, `europe-west3`, estado `RUNNABLE` |
+| Redis | `oms-staging-redis`, `STANDARD_HA`, estado `READY` |
+| VPC | `oms-staging-vpc` (además de `default`, la red automática de GCP no relacionada con este proyecto) |
+| Subred `private` | `10.20.0.0/20`, `europe-west3` — coincide exactamente con el diseño (índice 0 de `cidrsubnet`) |
+| Subred `connector` | `10.20.16.0/20`, `europe-west3` — coincide exactamente con el diseño (índice 1) |
+
+(El listado de subredes también mostró decenas de subredes `default` en cada región del mundo — son automáticas de GCP en cualquier proyecto nuevo, no relacionadas con este trabajo, se filtran mentalmente al buscar el prefijo `oms-staging-*`.)
+
+**URLs de verificación visual en consola** (documentadas para reutilizar en producción cambiando el project_id, y para volver a revisar en cualquier momento):
+
+| Recurso | URL |
+|---|---|
+| VPC | `https://console.cloud.google.com/networking/networks/details/oms-staging-vpc?project=acmeoms-staging-fatm` |
+| Subredes (listado) | `https://console.cloud.google.com/networking/networks/subnetworks?project=acmeoms-staging-fatm` |
+| Cloud Router + NAT | `https://console.cloud.google.com/net-services/nat/list?project=acmeoms-staging-fatm` |
+| Reglas de Firewall | `https://console.cloud.google.com/networking/firewalls/list?project=acmeoms-staging-fatm` |
+| Cloud SQL | `https://console.cloud.google.com/sql/instances/oms-staging-postgres/overview?project=acmeoms-staging-fatm` |
+| Memorystore Redis | `https://console.cloud.google.com/memorystore/redis/locations/europe-west3/instances/oms-staging-redis/details?project=acmeoms-staging-fatm` |
+| Secret Manager | `https://console.cloud.google.com/security/secret-manager/secret/oms-staging-db-password/versions?project=acmeoms-staging-fatm` |
+
+**Qué se espera ver en cada una:** VPC en modo subredes "personalizado"; ambas subredes en `europe-west3` con los rangos ya indicados; Cloud SQL en estado verde "Runnable" con alta disponibilidad (por `REGIONAL`); Redis en nivel "Estándar" y estado "Listo"; el secreto con exactamente 1 versión (la password generada por `random_password`).
+
+**Estado:** ✅ verificación por API hecha — 2026-09-21. Verificación visual en consola: pendiente de confirmación del usuario.

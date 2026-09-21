@@ -10,7 +10,7 @@
 #
 # Si te encuentras cambiando algo más, replantéatelo.
 
-project_id = "TODO-acme-oms-production"   # ⚠ TODO(alumno): proyecto distinto
+project_id = "acmeoms-production-fatm"    # proyecto GCP real de producción (Fase 0), distinto al de staging
 region     = "europe-west3"               # REG-GDPR-001
 env        = "production"
 
@@ -21,9 +21,13 @@ db_tier    = "db-custom-4-15360"          # 4 vCPU, 15 GB RAM
 cloud_run_min_instances = 2               # nunca a cero: latencia consistente
 cloud_run_max_instances = 25              # NFR-SCAL-001: pico 5× del normal
 
-image_repo = "europe-west3-docker.pkg.dev/TODO-project/oms"
-image_sha  = "sha256:TODO_MISMO_SHA_QUE_STAGING_TRAS_VALIDAR"
+# NOTA: igual que en staging.tfvars, image_sha se completa de verdad al
+# promocionar desde staging (Fase 5) — DEBE ser el mismo SHA exacto que ya
+# se validó en staging (regla innegociable del enunciado, penalización de
+# -10 pts si difiere).
+image_repo = "europe-west3-docker.pkg.dev/acmeoms-production-fatm/oms"
+image_sha  = "sha256:0000000000000000000000000000000000000000000000000000000000PENDIENTE_FASE_5"
 
 deletion_protection = true                # innegociable
 
-github_repository = "TODO-org/oms-platform"
+github_repository = "ftoscanomarquez/acmeoms-infraestructura"

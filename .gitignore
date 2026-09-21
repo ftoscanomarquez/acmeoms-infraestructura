@@ -1,1 +1,30 @@
 .DS_Store
+
+# ── Terraform ──────────────────────────────────────────────────────
+# .terraform/ se regenera con `terraform init`; contiene solo un puntero
+# al backend remoto (bucket real) y los binarios de providers descargados
+# — nunca el estado de infraestructura en sí (ese vive en el bucket GCS).
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+# Los .tfvars con valores reales de un entorno concreto NO se ignoran aquí
+# a propósito: envs/staging.tfvars y envs/production.tfvars ya vienen sin
+# secretos (son valores públicos: project_id, tier, etc.) y deben quedar
+# versionados — es lo que exige el enunciado. Si en algún momento se
+# necesitara un .tfvars con datos sensibles, debería nombrarse aparte
+# (ej. *.secret.tfvars) y añadirse aquí explícitamente.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ── Ansible ────────────────────────────────────────────────────────
+*.retry
+.ansible/
+
+# ── Python (usado por el plugin de inventario dinámico de Ansible) ──
+__pycache__/
+*.pyc

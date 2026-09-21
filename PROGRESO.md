@@ -8,9 +8,9 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 1 — Terraform: red y datos (3 de 6 puntos completos)
-**Último hito completado:** Módulos `network` y `database` completos y validados — juntos, sin conflictos entre sí (`terraform validate` conjunto desde la raíz solo mostró errores en `compute`, que aún no se toca, confirmando que `network`+`database` están correctos). En `database` se resolvió el TODO crítico de seguridad (password en texto plano → generada con `random_password` + guardada en Secret Manager) y se agregaron 3 `database_flags` de logging. Ver `oms-platform/BITACORA-COMANDOS.md` § Fase 1 para el detalle técnico completo.
-**Siguiente paso concreto:** Configurar el backend `gcs` real en `terraform/main.tf` (descomentar y completar con el bucket de staging), ejecutar el primer `terraform init` con backend real + `terraform plan -var-file=envs/staging.tfvars`, y evaluar si hace falta completar algo de `compute`/`iam` antes o si el plan ya puede limitarse a `network`+`database`.
+**Fase en curso:** Fase 1 — Terraform: red y datos (5 de 6 puntos completos — falta solo verificación visual)
+**Último hito completado:** ✅ **Los 17 recursos de `network`+`database` fueron aplicados exitosamente en GCP staging real** (`acmeoms-staging-fatm`), en 3 tandas por dos hallazgos resueltos en el camino: (1) faltaba habilitar `servicenetworking.googleapis.com` en la Fase 0 (corregido en ambos proyectos), y (2) condición de carrera entre Cloud SQL/Redis y la conexión de peering — corregida con `depends_on` explícito entre módulos (nuevo output `private_vpc_connection_id` en `network`, nueva variable homónima en `database`). Outputs finales: `db_connection_name = "acmeoms-staging-fatm:europe-west3:oms-staging-postgres"`, `redis_host = "10.152.126.148"`. Verificación cruzada contra la API de GCP (no solo la salida de Terraform) en curso.
+**Siguiente paso concreto:** Confirmar la verificación cruzada por API, guiar al usuario para verificar visualmente en la consola web de GCP, y cerrar formalmente la Fase 1. Después: Fase 2 (completar `compute` e `iam`).
 
 ---
 

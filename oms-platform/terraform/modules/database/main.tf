@@ -10,6 +10,12 @@ variable "private_subnet_id"   { type = string }
 variable "db_tier"             { type = string }
 variable "deletion_protection" { type = bool }
 variable "labels"              { type = map(string) }
+# Agregado por el equipo (hallazgo de la Fase 1): se usa solo para forzar
+# con `depends_on` que Cloud SQL y Redis esperen a que la conexión de
+# peering del módulo `network` exista de verdad antes de intentar crearse
+# — sin esto, Terraform puede lanzarlos en paralelo y fallan con
+# "network doesn't have at least 1 private services connection".
+variable "private_vpc_connection_id" { type = string }
 
 # ─── Password aleatoria gestionada por GCP en Secret Manager ──────
 #
@@ -119,6 +125,15 @@ resource "google_sql_database_instance" "main" {
   lifecycle {
     prevent_destroy = true             # defensa adicional contra terraform destroy
   }
+
+  # NOTA DE DISEÑO (agregado por el equipo, hallazgo real durante el primer
+  # `apply` a staging): sin este depends_on explícito, Terraform intentó
+  # crear esta instancia EN PARALELO con la conexión de peering del módulo
+  # network (no hay ninguna referencia directa entre sus argumentos que
+  # imponga el orden — `private_network = var.network_id` apunta a la VPC,
+  # no a la conexión de peering en sí). El resultado fue el error real:
+  # "the network doesn't have at least 1 private services connection".
+  depends_on = [var.private_vpc_connection_id]
 }
 
 # ─── Base de datos para el OMS ────────────────────────────────────
@@ -161,6 +176,11 @@ resource "google_redis_instance" "cache" {
   auth_enabled            = true
 
   labels = var.labels
+
+  # Mismo motivo que en google_sql_database_instance.main (ver comentario
+  # ahí arriba): Redis con connect_mode = PRIVATE_SERVICE_ACCESS también
+  # depende de que la conexión de peering exista antes de intentar crearse.
+  depends_on = [var.private_vpc_connection_id]
 }
 
 # ─── Outputs ──────────────────────────────────────────────────────

@@ -215,3 +215,12 @@ output "private_subnet_cidr" { value = google_compute_subnetwork.private.ip_cidr
 # para crear el VPC Access Connector de Cloud Run.
 output "connector_subnet_id"   { value = google_compute_subnetwork.connector.id }
 output "connector_subnet_cidr" { value = google_compute_subnetwork.connector.ip_cidr_range }
+
+# Agregado por el equipo (hallazgo de la Fase 1, ver BITACORA-COMANDOS.md):
+# el módulo `database` necesita poder declarar `depends_on` explícito sobre
+# esta conexión de peering. Sin esta dependencia explícita, Terraform puede
+# lanzar la creación de Cloud SQL/Redis EN PARALELO con esta conexión (no
+# hay ninguna referencia directa entre sus argumentos que le indique el
+# orden), y ambos fallan con "network doesn't have at least 1 private
+# services connection" aunque la conexión sí exista momentos después.
+output "private_vpc_connection_id" { value = google_service_networking_connection.private_vpc_connection.id }

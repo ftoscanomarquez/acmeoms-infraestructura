@@ -2,19 +2,31 @@
 # Cada módulo encapsula una capa de la arquitectura del OMS.
 
 # ┌─────────────────────────────────────────────────────────┐
-# │ Backend de estado en GCS.                              │
-# │ TODO(alumno): rellena con tu bucket y descomenta.      │
-# │                                                         │
-# │ terraform {                                             │
-# │   backend "gcs" {                                       │
-# │     bucket = "<tu-proyecto>-tfstate"                    │
-# │     prefix = "oms-platform/${var.env}"                  │
-# │   }                                                     │
-# │ }                                                       │
-# │                                                         │
-# │ ⚠ El backend NO puede usar variables — tienes que       │
-# │   parametrizar con `terraform init -backend-config`.   │
+# │ Backend de estado en GCS.                                │
 # └─────────────────────────────────────────────────────────┘
+# NOTA DE DISEÑO (agregado por el equipo): el bloque `backend` se procesa
+# ANTES de que Terraform lea var.env o cualquier .tfvars — es literalmente
+# el primer paso de `terraform init`. Por eso NO admite interpolación de
+# variables (`${var.env}` aquí sería un error). El bucket real (que sí
+# cambia entre staging y producción — creados en la Fase 0 como
+# acmeoms-staging-fatm-tfstate y acmeoms-production-fatm-tfstate) se pasa
+# por fuera, en el momento del init, con `-backend-config`:
+#
+#   # Staging:
+#   terraform init -backend-config="bucket=acmeoms-staging-fatm-tfstate" \
+#                   -backend-config="prefix=oms-platform/staging"
+#
+#   # Producción:
+#   terraform init -backend-config="bucket=acmeoms-production-fatm-tfstate" \
+#                   -backend-config="prefix=oms-platform/production"
+#
+# El bloque de abajo se deja intencionalmente VACÍO de valores concretos —
+# solo declara que el backend es de tipo "gcs"; los valores reales llegan
+# siempre por -backend-config, nunca hardcodeados aquí (así el mismo código
+# sirve para ambos entornos, sin tocar este archivo al cambiar de bucket).
+terraform {
+  backend "gcs" {}
+}
 
 provider "google" {
   project = var.project_id
@@ -63,6 +75,10 @@ module "database" {
   db_tier             = var.db_tier
   deletion_protection = var.deletion_protection
   labels              = local.common_labels
+  # Agregado por el equipo (hallazgo Fase 1): fuerza el orden correcto de
+  # creación entre la conexión de peering (module.network) y Cloud
+  # SQL/Redis (module.database) — ver comentarios en modules/database/main.tf.
+  private_vpc_connection_id = module.network.private_vpc_connection_id
 }
 
 # ┌─────────────────────────────────────────────────────────┐

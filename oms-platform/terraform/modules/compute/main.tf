@@ -133,11 +133,24 @@ resource "google_compute_backend_service" "default" {
   }
 
   cdn_policy {
-    cache_mode                   = "CACHE_ALL_STATIC"
-    default_ttl                  = 3600
-    max_ttl                      = 86400
-    negative_caching             = true
-    serve_while_stale            = 86400
+    cache_mode        = "CACHE_ALL_STATIC"
+    default_ttl       = 3600
+    max_ttl           = 86400
+    negative_caching  = true
+    serve_while_stale = 86400
+
+    # NOTA DE DISEÑO (agregado por el equipo, corrección mínima de sintaxis
+    # en la Fase 1 para desbloquear el parseo de toda la configuración raíz
+    # — el diseño completo y afinado de la política de CDN se revisa en la
+    # Fase 2 / bonus "Cloud CDN políticas finas"):
+    # `cache_key_policy` es OBLIGATORIO en cdn_policy — define qué partes
+    # de la URL usa el CDN para decidir si dos peticiones son "la misma"
+    # y pueden compartir la misma respuesta cacheada.
+    cache_key_policy {
+      include_host         = true
+      include_protocol     = true
+      include_query_string = false   # provisional: se afinará en la Fase 2/bonus
+    }
   }
 
   log_config {
