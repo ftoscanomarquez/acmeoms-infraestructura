@@ -6,6 +6,26 @@
 
 ---
 
+## 🏁 AVANCE TOTAL DEL TRABAJO — **~92% completo**
+
+**Rúbrica base (100 pts): ✅ completa y verificada contra GCP real · Bonus (0/5): ⏳ pendiente**
+
+| Fase | Estado | % |
+|---|---|---|
+| Fase 0 — Cuentas, accesos y doble remoto | ✅ COMPLETA | 100% |
+| Fase 1 — Terraform: red y datos | ✅ COMPLETA | 100% |
+| Fase 2 — Terraform: cómputo e IAM | ✅ COMPLETA | 100% |
+| Fase 3 — Docker + primer despliegue manual | ✅ COMPLETA | 100% |
+| Fase 4 — Ansible: staging | ✅ COMPLETA | 100% |
+| Fase 5 — Producción | ✅ COMPLETA | 100% |
+| Fase 6 — CI/CD (GitHub Actions + WIF) | ✅ COMPLETA | 100% |
+| Fase 7 — Bonus (5 opcionales) | ⏳ NO INICIADA | 0% |
+| Fase 8 — Documentación final | 🟡 CASI COMPLETA | ~85% |
+
+**Lo único que falta para la entrega base (100 pts de rúbrica) es**: re-ejecutar los 7 comandos de verificación del enunciado en una sola pasada limpia y decidir si se hace el `terraform destroy` final. Todo lo demás de la rúbrica base (Fases 0-6 + Fase 8) está hecho y verificado contra GCP real. Los 5 bonus de la Fase 7 (+35 pts posibles) están sin empezar — es la única fase realmente pendiente de fondo.
+
+---
+
 ## 📍 Estado actual
 
 **Fase en curso:** Fase 6 (CI/CD) ✅ **COMPLETA** y Fase 8 (documentación final) ✅ **CASI COMPLETA** — los 6 documentos principales (`README.md`, `INFRA.md`, `DEPLOYMENT.md`, `OBSERVABILIDAD.md`, `CERTIFICADOS.md`, `RETROSPECTIVA.md`) ya están escritos, basados en lectura directa del código real. Falta re-ejecutar los 7 comandos de verificación del enunciado en una sola pasada limpia, y decidir sobre Fase 7 (bonus).
@@ -104,11 +124,11 @@ Pendiente de esta sub-tarea: releer los 6 documentos una vez más buscando incon
 
 ### Fase 2 — Terraform: cómputo e IAM ✅ COMPLETA
 
-- [x] Completar módulo `compute` (probes → `/health` tras hallazgo de GFE, VPC connector → `/28` tras hallazgo de netmask, certificado SSL + proxy HTTPS + forwarding rule, Artifact Registry, binding IAM público)
-- [x] Completar módulo `iam` (roles mínimos del SA de CI/CD: `run.developer`, `iam.serviceAccountUser`, `artifactregistry.writer`+`reader`)
-- [x] `terraform apply` completo a staging — 38/38 recursos totales aplicados (múltiples hallazgos resueltos: API `vpcaccess` faltante, connector residual en ERROR, lock de estado huérfano tras corte de sesión, import del connector, IAM vacío, endpoint `/healthz` interceptado por GFE)
-- [x] Verificar recursos en consola GCP — Cloud Run público y funcional (`curl /health` → 200 OK)
-- [ ] Segundo `terraform plan` → confirmar "No changes" (pendiente de re-verificar tras los últimos cambios de esta sesión)
+- [x] Completar módulo `compute`: Cloud Run v2 (imagen por digest, `startup_probe`/`liveness_probe` → `/health` tras hallazgo de GFE, `lifecycle.ignore_changes` sobre imagen/tráfico/revisión), VPC Access Connector (`/28` tras hallazgo de netmask), Artifact Registry declarado en Terraform (revertido de un `gcloud create` manual inicial), Load Balancer completo (NEG serverless + backend service con Cloud CDN + url map + certificado SSL managed + proxy HTTPS + forwarding rule), binding IAM público (`roles/run.invoker` a `allUsers`)
+- [x] Completar módulo `iam`: WIF pool + provider por entorno (`issuer_uri` de GitHub Actions), Service Account de CI/CD con roles mínimos (`run.developer`, `artifactregistry.writer`+`reader`, `iam.serviceAccountUser` acotado al SA de runtime — endurecido más tarde en la Fase 6 tras un hallazgo de Trivy), Service Account de runtime con `cloudsql.client` + `secretmanager.secretAccessor`
+- [x] `terraform apply` completo a staging — **38/38 recursos totales aplicados**, resolviendo en el camino: API `vpcaccess.googleapis.com` faltante, VPC Connector rechazado por netmask incorrecta, connector residual en estado ERROR tras un corte de sesión + lock de estado huérfano (`terraform force-unlock` + `terraform import` del connector real), política IAM de Cloud Run vacía (403/404 en toda ruta), endpoint `/healthz` interceptado por Google Front End antes de llegar al contenedor
+- [x] Verificar recursos en consola GCP y por API real — Cloud Run público y funcional (`curl https://oms-staging-....run.app/health` → `200 {"status":"ok"}`)
+- [x] Segundo `terraform plan` → confirmado "No changes" en múltiples ocasiones a lo largo del proyecto (Fase 5, Fase 6) tras cada corrección — el módulo `compute` en sí quedó estable ya en esta fase
 
 ### Fase 3 — Docker + primer despliegue manual ✅ COMPLETA (adelantada durante la Fase 2)
 
@@ -119,19 +139,25 @@ Pendiente de esta sub-tarea: releer los 6 documentos una vez más buscando incon
 
 > Nota: el DESPLIEGUE de esta imagen a Cloud Run (que la ponga a servir tráfico real) no es un paso de la Fase 3 — es el contenido completo de la Fase 4 (Ansible), donde el `image_sha` se pasa como parámetro `-e` al playbook, no editando archivos. Recuerda que Terraform ignora deliberadamente los cambios de imagen (`lifecycle.ignore_changes`) desde el primer `apply` de Cloud Run.
 
-### Fase 4 — Ansible: staging
+### Fase 4 — Ansible: staging ✅ COMPLETA
 
-- [ ] Completar `deploy.yml` (healthcheck post-deploy, notificación)
-- [ ] Completar `rollback.yml` (listar revisiones, redirigir tráfico)
-- [ ] Completar role `oms_cloud_run` (traffic-splitting real, espera a `Ready`)
-- [ ] Ejecutar `ansible-playbook deploy.yml -e env=staging -e image_sha=...`
-- [ ] Repetir el mismo comando → verificar `changed=0`
+- [x] Completar `deploy.yml`: valida parámetros (`env`, `image_sha` con regex `sha256:[a-f0-9]{64}`), despliega vía el rol `oms_cloud_run`, healthcheck post-deploy con reintentos (`until`/`retries` contra `/health`), notificación a Slack condicional (`when: slack_webhook_url is defined` — sin workspace real asociado, documentado a propósito)
+- [x] Completar `rollback.yml`: identifica la revisión activa real por `status.traffic[]` (`percent==100`), **no** por orden de creación — corregido tras un hallazgo real (una revisión de prueba sin tráfico más reciente habría causado un rollback no-op silencioso); valida que exista exactamente una revisión al 100%; encuentra la N-1 cruzando con `gcloud run revisions list`; redirige el 100% del tráfico
+- [x] Completar rol `oms_cloud_run`: traffic-splitting real (`--to-tags`/`--to-revisions` según el caso), espera activa a `Ready` (`until`/`retries` sobre `status.conditions[0].status`), idempotencia verificada comparando 4 campos (imagen, cpu, memoria, max_instances) — no solo la imagen, tras detectar que un cambio de capacidad sin tocar la imagen no se aplicaba con el diseño inicial
+- [x] Ejecutar `ansible-playbook deploy.yml -e env=staging -e image_sha=...` — despliegue real verificado contra `acmeoms-staging-fatm`, healthcheck `200 OK` confirmado con `curl` externo
+- [x] Repetir el mismo comando → verificado `changed=0` en la segunda ejecución (idempotencia real, no solo teórica)
+- [x] Resueltos en el camino: `ansible.cfg` no cargaba desde WSL sobre `/mnt/d/...` (`ANSIBLE_CONFIG` explícito), callback `community.general.yaml` eliminado de la colección (`ANSIBLE_STDOUT_CALLBACK=default`), proyecto activo de `gcloud` perdido tras corte de sesión, bug de `--format=value(...)` partido en varias líneas YAML, bug de `regex_replace` con backreferences sin resolver al recibir `image_sha` por `-e` (reemplazado por slicing simple de Jinja2)
 
-### Fase 5 — Producción
+### Fase 5 — Producción ✅ COMPLETA
 
-- [ ] `terraform apply -var-file=envs/production.tfvars`
-- [ ] `ansible-playbook deploy.yml -e env=production -e image_sha=<mismo SHA que staging>`
-- [ ] Verificar canary al 10% en producción
+- [x] `terraform apply -var-file=envs/production.tfvars` — **39 recursos reales aplicados** en `acmeoms-production-fatm` (red, Cloud SQL, Redis, IAM/WIF, Load Balancer, Cloud Run, Artifact Registry), resolviendo en el camino un choque real de cuota de CPU (`CpuAllocPerProjectRegion` excedida con el `max_instances` original de NFR-SCAL-001) y un recurso marcado `tainted` tras un `apply` interrumpido
+- [x] `ansible-playbook deploy.yml -e env=production -e image_sha=<mismo SHA que staging>` — **imagen promocionada con el mismo digest SHA-256 exacto** (copiada, nunca reconstruida — verificado carácter por carácter), primer despliegue real a producción, healthcheck externo confirmado con `curl`
+- [x] Verificar canary al 10% en producción — verificado con un segundo build real (`v0.2.0`): dos revisiones sirviendo tráfico y contenido distinto simultáneamente, confirmado con `curl` repetido
+- [x] **Rediseño real solicitado por el usuario a mitad de la fase**: `cpu`/`memory`/`min_instances`/`max_instances` dejaron de duplicarse a mano entre Terraform y Ansible (causa raíz de un drift real detectado — `memory` desalineada silenciosamente) — Terraform pasó a exponerlos como outputs, Ansible los lee en vivo con `terraform output -json` en cada despliegue
+- [x] Ciclo completo canary + rollback verificado contra producción real, en ambos escenarios: rollback con tráfico en canary (falla explícitamente, comportamiento correcto) y rollback con una única revisión al 100% (éxito real, tráfico movido a la N-1)
+- [x] Ambos entornos confirmados en estado estable: `terraform plan` → "No changes" en staging y producción
+
+> 📋 Detalle completo hora por hora de esta fase (completada de forma autónoma durante una noche, a petición del usuario) en la sección **"Reporte Fase 5"** al final de este archivo — incluye tabla de 11 issues reales encontrados y resueltos, y las decisiones tomadas de forma autónoma para revisar al despertar.
 
 ### Fase 6 — CI/CD (GitHub Actions + WIF) ✅ COMPLETA
 
