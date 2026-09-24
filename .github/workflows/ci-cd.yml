@@ -292,10 +292,20 @@ jobs:
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             "${{ needs.build.outputs.full_image_staging }}"
 
+      # HALLAZGO REAL (ver BITACORA-COMANDOS.md § 6.13): `ansible.cfg` define
+      # `collections_path = .collections` (relativo a oms-platform/ansible/).
+      # Sin `working-directory` aquí, `ansible-galaxy collection install`
+      # corría desde la raíz del repo, ignoraba ese ansible.cfg, e instalaba
+      # todo en la ubicación por defecto (~/.ansible/collections) — que
+      # `ansible-playbook` (sí con working-directory correcto, sí leyendo
+      # ansible.cfg) nunca llegaba a mirar. Resultado: `community.general`
+      # SÍ se instalaba con éxito, pero en el sitio equivocado, y Ansible
+      # fallaba al resolver `community.general.slack` como si no existiera.
       - name: "Instalar Ansible + colecciones"
+        working-directory: oms-platform/ansible
         run: |
           pip install ansible-core
-          ansible-galaxy collection install -r oms-platform/ansible/requirements.yml
+          ansible-galaxy collection install -r requirements.yml
 
       - name: "ansible-playbook deploy.yml -e env=staging"
         working-directory: oms-platform/ansible
@@ -356,10 +366,14 @@ jobs:
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             "${{ env.REGION }}-docker.pkg.dev/${{ vars.PRODUCTION_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image_sha }}"
 
+      # Mismo hallazgo real que en deploy-staging (ver BITACORA-COMANDOS.md
+      # § 6.13): ansible-galaxy debe correr con working-directory correcto
+      # para respetar el collections_path de ansible.cfg.
       - name: "Instalar Ansible + colecciones"
+        working-directory: oms-platform/ansible
         run: |
           pip install ansible-core
-          ansible-galaxy collection install -r oms-platform/ansible/requirements.yml
+          ansible-galaxy collection install -r requirements.yml
 
       - name: "ansible-playbook deploy.yml -e env=production (canary 10% real, ver group_vars/production.yml)"
         working-directory: oms-platform/ansible

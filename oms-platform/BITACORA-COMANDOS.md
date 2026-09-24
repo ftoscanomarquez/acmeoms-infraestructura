@@ -2695,3 +2695,21 @@ on resource "projects/acmeoms-staging-fatm/locations/europe-west3/repositories/o
 **Corrección:** se agregó `gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet` entre `setup-gcloud` y `cosign verify` en el job `deploy-staging` — mismo comando ya usado en `build`. Se revisó también `deploy-production`: ese job ya tenía el `configure-docker` correcto antes de su propio `cosign verify` (viene después del `docker push` de producción), así que no necesitó el mismo fix.
 
 **Patrón general para recordar**: cualquier paso que use `cosign` (`sign` o `verify`) contra una imagen en un registro privado necesita que el paso `gcloud auth configure-docker` ya se haya ejecutado ANTES en ese mismo job — Cosign no hereda la autenticación de `google-github-actions/auth` directamente, solo a través de las credenciales de Docker que ese comando escribe.
+
+### 6.13 · Tercer intento — hallazgo real: `ansible-galaxy` corría desde el directorio equivocado
+
+Con `cosign verify` ya funcionando, el pipeline avanzó hasta `ansible-playbook deploy.yml`, que falló con exit code 4 (código reservado de Ansible para errores de "no se pudo conectar/resolver"):
+
+```
+[ERROR]: couldn't resolve module/action 'community.general.slack'. This often indicates a
+misspelling, missing collection, or incorrect module path.
+Origin: .../oms-platform/ansible/playbooks/deploy.yml:123:7
+```
+
+**Punto pedagógico importante para el video**: Ansible resuelve la EXISTENCIA de un módulo/acción referenciado en una tarea ANTES de evaluar su `when:` — así que aunque `slack_webhook_url` nunca esté definida en el entorno de evaluación (y por tanto esa tarea nunca debería ejecutarse de verdad), Ansible igual necesita poder "encontrar" el módulo `community.general.slack` en el momento de parsear el playbook, o falla ahí mismo, sin llegar siquiera a mirar el `when:`.
+
+**Diagnóstico:** se revisó el log completo (no solo el mensaje de error) del paso "Instalar Ansible + colecciones" — mostraba **las 3 colecciones instaladas con éxito**, incluida `community.general:13.4.0 was installed successfully`. Es decir, la instalación en sí NO había fallado — el problema era otro. `oms-platform/ansible/ansible.cfg` declara `collections_path = .collections` (ruta relativa a ese directorio). El paso `ansible-galaxy collection install -r oms-platform/ansible/requirements.yml` se ejecutaba SIN `working-directory: oms-platform/ansible` — corría desde la raíz del repo, donde no existe ningún `ansible.cfg`, así que `ansible-galaxy` ignoró esa configuración e instaló las colecciones en la ubicación por defecto (`~/.ansible/collections`). El paso siguiente, `ansible-playbook` (que SÍ tenía `working-directory: oms-platform/ansible` desde el principio), sí leía ese `ansible.cfg`, y por tanto solo buscaba colecciones en `.collections/` — un directorio que nunca se llegó a poblar.
+
+**Corrección:** se agregó `working-directory: oms-platform/ansible` al paso "Instalar Ansible + colecciones" en ambos jobs (`deploy-staging` y `deploy-production`), y se simplificó la ruta del `requirements.yml` a relativa (`-r requirements.yml`, ya que el `cwd` ahora es el correcto).
+
+**Intento de reproducir el hallazgo de forma aislada localmente**: se intentó simular el escenario (instalar colecciones desde un directorio sin `ansible.cfg`, luego intentar resolver el módulo desde uno con `ansible.cfg` apuntando a un `.collections` vacío) — no se logró reproducir exactamente el fallo en un entorno WSL local, porque ya existían colecciones instaladas de sesiones anteriores en la ubicación por defecto del sistema, contaminando la prueba. Se optó por confiar en la evidencia directa del log real de GitHub Actions (que sí mostró el path exacto de instalación, `~/.ansible/collections/ansible_collections/community/general`, distinto del `collections_path` configurado) en vez de insistir en una reproducción aislada — el fix es correcto independientemente de si se pudo replicar el síntoma exacto en local.
