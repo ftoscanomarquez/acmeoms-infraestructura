@@ -126,11 +126,28 @@
     # principio, Cloud Run NO reparte automáticamente el resto a quien ya
     # lo tenía. Hay que nombrar AMBAS revisiones con AMBOS porcentajes,
     # sumando exactamente 100%, en la misma llamada.
+    #
+    # SEGUNDO HALLAZGO REAL (canary-decision.yml, primera ejecución real
+    # desde GitHub Actions — ver BITACORA-COMANDOS.md § 6.21): tras varias
+    # rondas de pruebas de promote/rollback, producción llegó a tener 3
+    # revisiones con tráfico simultáneo (una tercera sobreviviente de un
+    # ciclo anterior, con 0% pero listada igual por `status.traffic[]`).
+    # El `awk` de abajo, sin acotar, devolvía DOS líneas de "otra revisión"
+    # separadas por salto de línea — que Jinja2 pegaba tal cual dentro de
+    # --to-revisions, generando un argumento inválido:
+    #   "...,oms-production-00003-yod\noms-production-00008-qeb=50"
+    # gcloud lo rechazaba con "Bad syntax for dict arg". Se corrige
+    # tomando SOLO la primera línea (`.split('\n')[0]`): cualquier otra
+    # revisión sobrante queda automáticamente en 0% al no ser mencionada
+    # (Cloud Run pone a 0% a toda revisión no listada en --to-revisions),
+    # que es exactamente el comportamiento deseado — solo canary + una
+    # "revisión estable" deben quedarse con tráfico real.
     - name: "Identificar la OTRA revisión (la que tiene el resto del tráfico)"
       ansible.builtin.shell:
         cmd: >-
           echo "{{ traffic_result.stdout }}"
           | awk -F'\t' -v rev="{{ canary_revision }}" '$1!=rev{print $1}'
+          | head -n1
       register: other_revision_result
       changed_when: false
       failed_when: false
@@ -166,11 +183,18 @@
 
     - name: "Componer el argumento --to-revisions (100% si target=100, ambas revisiones si no)"
       ansible.builtin.set_fact:
+        # other_revision_result.stdout ya viene acotado a una sola línea
+        # (ver el `head -n1` de la tarea anterior), pero se aplica
+        # `.split('\n')[0]` también aquí como segunda capa de defensa: si
+        # algún día ese comando cambia y vuelve a devolver más de una
+        # línea, este filtro evita construir un --to-revisions inválido
+        # en silencio (falla de forma visible en el plan mostrado, no con
+        # un error críptico de gcloud).
         to_revisions_arg: >-
           {{
             canary_revision ~ '=' ~ target_percent
             if (target_percent | int) == 100
-            else canary_revision ~ '=' ~ target_percent ~ ',' ~ other_revision_result.stdout ~ '=' ~ (100 - (target_percent | int))
+            else canary_revision ~ '=' ~ target_percent ~ ',' ~ (other_revision_result.stdout.split('\n')[0]) ~ '=' ~ (100 - (target_percent | int))
           }}
 
     - name: "Mostrar plan de promoción antes de aplicarlo"
