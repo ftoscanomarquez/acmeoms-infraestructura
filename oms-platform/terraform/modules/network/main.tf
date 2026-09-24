@@ -3,10 +3,10 @@
 # Sin IPs públicas en compute: salida a internet vía Cloud NAT.
 
 variable "project_id" { type = string }
-variable "region"     { type = string }
-variable "env"        { type = string }
-variable "vpc_cidr"   { type = string }
-variable "labels"     { type = map(string) }
+variable "region" { type = string }
+variable "env" { type = string }
+variable "vpc_cidr" { type = string }
+variable "labels" { type = map(string) }
 
 # ─── VPC ──────────────────────────────────────────────────────────
 resource "google_compute_network" "main" {
@@ -37,10 +37,10 @@ resource "google_compute_network" "main" {
 # el tráfico del connector de forma distinta al resto.
 resource "google_compute_subnetwork" "private" {
   name                     = "oms-${var.env}-private"
-  ip_cidr_range            = cidrsubnet(var.vpc_cidr, 4, 0)  # /20 del /16 → 10.20.0.0/20 (4.096 IPs)
+  ip_cidr_range            = cidrsubnet(var.vpc_cidr, 4, 0) # /20 del /16 → 10.20.0.0/20 (4.096 IPs)
   region                   = var.region
   network                  = google_compute_network.main.id
-  private_ip_google_access = true   # acceso a APIs de Google sin salir a internet
+  private_ip_google_access = true # acceso a APIs de Google sin salir a internet
 }
 
 # ─── Subred para el VPC Access Connector (Cloud Run → Redis privado) ──
@@ -64,8 +64,8 @@ resource "google_compute_subnetwork" "private" {
 resource "google_compute_subnetwork" "connector" {
   name = "oms-${var.env}-connector"
   ip_cidr_range = cidrsubnet(
-    cidrsubnet(var.vpc_cidr, 4, 1),  # 10.20.16.0/20 (el mismo "carril" reservado antes)
-    8, 0                              # + 8 bits: /20 → /28 (20+8=28) → 10.20.16.0/28
+    cidrsubnet(var.vpc_cidr, 4, 1), # 10.20.16.0/20 (el mismo "carril" reservado antes)
+    8, 0                            # + 8 bits: /20 → /28 (20+8=28) → 10.20.16.0/28
   )
   region                   = var.region
   network                  = google_compute_network.main.id
@@ -130,7 +130,7 @@ resource "google_compute_router_nat" "main" {
 
   log_config {
     enable = true
-    filter = "ERRORS_ONLY"   # registra solo conexiones NAT fallidas (falta de puertos/IPs), útil para diagnosticar sin generar ruido de logs por cada conexión exitosa
+    filter = "ERRORS_ONLY" # registra solo conexiones NAT fallidas (falta de puertos/IPs), útil para diagnosticar sin generar ruido de logs por cada conexión exitosa
   }
 }
 
@@ -150,8 +150,8 @@ resource "google_compute_router_nat" "main" {
 # hablarse entre sí aunque vivan en la misma VPC: el deny-all de entrada
 # aplica también al tráfico que viene de dentro de la propia red.
 resource "google_compute_firewall" "allow_internal" {
-  name    = "oms-${var.env}-allow-internal"
-  network = google_compute_network.main.id
+  name      = "oms-${var.env}-allow-internal"
+  network   = google_compute_network.main.id
   direction = "INGRESS"
 
   allow {
@@ -163,10 +163,10 @@ resource "google_compute_firewall" "allow_internal" {
     ports    = ["0-65535"]
   }
   allow {
-    protocol = "icmp"   # permite ping / diagnóstico de red entre recursos internos
+    protocol = "icmp" # permite ping / diagnóstico de red entre recursos internos
   }
 
-  source_ranges = [var.vpc_cidr]   # 10.20.0.0/16 — toda la VPC, cubre private y connector
+  source_ranges = [var.vpc_cidr] # 10.20.0.0/16 — toda la VPC, cubre private y connector
 }
 
 # Regla 2 · SSH vía IAP (Identity-Aware Proxy), para el bastion del bonus.
@@ -180,8 +180,8 @@ resource "google_compute_firewall" "allow_internal" {
 # "iap-ssh" (target_tags), así que hoy no afecta a ningún recurso — queda
 # lista para cuando se implemente el bastion en la Fase 7.
 resource "google_compute_firewall" "allow_iap_ssh" {
-  name    = "oms-${var.env}-allow-iap-ssh"
-  network = google_compute_network.main.id
+  name      = "oms-${var.env}-allow-iap-ssh"
+  network   = google_compute_network.main.id
   direction = "INGRESS"
 
   allow {
@@ -189,7 +189,7 @@ resource "google_compute_firewall" "allow_iap_ssh" {
     ports    = ["22"]
   }
 
-  source_ranges = ["35.235.240.0/20"]   # rango oficial de IAP (Google)
+  source_ranges = ["35.235.240.0/20"] # rango oficial de IAP (Google)
   target_tags   = ["iap-ssh"]
 }
 
@@ -203,8 +203,8 @@ resource "google_compute_firewall" "allow_iap_ssh" {
 # marcaría el servicio como "caído" (sus propios chequeos de salud
 # quedarían bloqueados por el deny-all) y dejaría de enviarle tráfico real.
 resource "google_compute_firewall" "allow_lb_health_checks" {
-  name    = "oms-${var.env}-allow-lb-health-checks"
-  network = google_compute_network.main.id
+  name      = "oms-${var.env}-allow-lb-health-checks"
+  network   = google_compute_network.main.id
   direction = "INGRESS"
 
   allow {
@@ -212,13 +212,13 @@ resource "google_compute_firewall" "allow_lb_health_checks" {
     ports    = ["8080"]
   }
 
-  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]   # rangos oficiales de GFE (Google)
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"] # rangos oficiales de GFE (Google)
 }
 
 # ─── Outputs ──────────────────────────────────────────────────────
-output "network_id"          { value = google_compute_network.main.id }
-output "network_self_link"   { value = google_compute_network.main.self_link }
-output "private_subnet_id"   { value = google_compute_subnetwork.private.id }
+output "network_id" { value = google_compute_network.main.id }
+output "network_self_link" { value = google_compute_network.main.self_link }
+output "private_subnet_id" { value = google_compute_subnetwork.private.id }
 output "private_subnet_cidr" { value = google_compute_subnetwork.private.ip_cidr_range }
 # Agregado por el equipo: la Fase 2 (módulo compute) necesita esta subred
 # para crear el VPC Access Connector de Cloud Run. Se exponen tanto `.id`
@@ -226,7 +226,7 @@ output "private_subnet_cidr" { value = google_compute_subnetwork.private.ip_cidr
 # GCP consumidores exigen formatos distintos — hallazgo real detectado al
 # aplicar google_vpc_access_connector, que exige específicamente el
 # nombre corto en su campo subnet.name (ver módulo compute).
-output "connector_subnet_id"   { value = google_compute_subnetwork.connector.id }
+output "connector_subnet_id" { value = google_compute_subnetwork.connector.id }
 output "connector_subnet_name" { value = google_compute_subnetwork.connector.name }
 output "connector_subnet_cidr" { value = google_compute_subnetwork.connector.ip_cidr_range }
 

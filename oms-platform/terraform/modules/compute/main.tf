@@ -2,17 +2,28 @@
 # Cloud Run para el monolito OMS + HTTPS Load Balancer + Cloud CDN.
 # Cloud Run es stateless: NFR-SCAL-001 (autoescalado horizontal hasta 5×).
 
-variable "project_id"              { type = string }
-variable "region"                  { type = string }
-variable "env"                     { type = string }
-variable "image_repo"              { type = string }
-variable "image_sha"               { type = string }
+variable "project_id" { type = string }
+variable "region" { type = string }
+variable "env" { type = string }
+variable "image_repo" { type = string }
+variable "image_sha" { type = string }
 variable "cloud_run_min_instances" { type = number }
 variable "cloud_run_max_instances" { type = number }
-variable "db_connection_name"      { type = string }
-variable "db_secret_id"            { type = string }
-variable "redis_host"              { type = string }
-variable "labels"                  { type = map(string) }
+# HALLAZGO REAL (Fase 5): cpu/memory estaban hardcodeados aquí abajo
+# ("1000m"/"2Gi" fijos para AMBOS entornos), mientras que
+# ansible/group_vars/production.yml pedía 2000m — Ansible intentaba "subir"
+# una CPU que Terraform ya había fijado en 1000m, y la suma de ambas
+# revisiones coexistiendo (la vieja de Terraform + la nueva de Ansible)
+# excedía la cuota CpuAllocPerProjectRegion. Se parametriza para que
+# Terraform sea la única fuente de verdad de la "forma" del contenedor
+# (principio ya aplicado a min/max_instances) y Ansible solo compare
+# contra estos mismos valores, nunca los cambie por su cuenta.
+variable "cloud_run_cpu" { type = string }
+variable "cloud_run_memory" { type = string }
+variable "db_connection_name" { type = string }
+variable "db_secret_id" { type = string }
+variable "redis_host" { type = string }
+variable "labels" { type = map(string) }
 # Agregado por el equipo: subred dedicada (preparada en el módulo network,
 # Fase 1) para el VPC Access Connector que permite a Cloud Run alcanzar
 # Memorystore Redis por IP privada. Se necesitan DOS formas del mismo
@@ -20,8 +31,8 @@ variable "labels"                  { type = map(string) }
 # `connector_subnet_id` (ruta completa, sin uso actual pero se deja
 # disponible para otros posibles usos futuros) y `connector_subnet_name`
 # (nombre corto, el que realmente exige `google_vpc_access_connector`).
-variable "connector_subnet_id"     { type = string }
-variable "connector_subnet_name"   { type = string }
+variable "connector_subnet_id" { type = string }
+variable "connector_subnet_name" { type = string }
 # Agregado por el equipo: dominio para el certificado SSL managed del Load
 # Balancer. DECISIÓN DOCUMENTADA (ver BITACORA-COMANDOS.md Fase 2): un
 # dominio real es un recurso que se compra por separado a un registrador
@@ -33,7 +44,7 @@ variable "connector_subnet_name"   { type = string }
 # despliegue). Cloud Run sigue siendo accesible por su propia URL nativa
 # con HTTPS ya válido (output cloud_run_url) mientras tanto.
 variable "lb_domain" {
-  type    = string
+  type = string
   # En minúsculas a propósito: GCP normaliza automáticamente el campo
   # `domains` de un certificado managed a minúsculas al crearlo. Si aquí se
   # escribe con mayúsculas, Terraform detecta una diferencia permanente
@@ -79,8 +90,8 @@ resource "google_service_account" "cloud_run" {
 # actúa de intermediario — Cloud Run le envía el tráfico destinado a la
 # red privada, y el connector lo reenvía hasta la IP privada de Redis.
 resource "google_vpc_access_connector" "redis" {
-  name    = "oms-${var.env}-connector"
-  region  = var.region
+  name   = "oms-${var.env}-connector"
+  region = var.region
   subnet {
     # NOTA DE DISEÑO (hallazgo real durante el apply de la Fase 2): el
     # campo `subnet.name` de este recurso espera el NOMBRE CORTO de la
@@ -126,8 +137,8 @@ resource "google_cloud_run_v2_service" "oms" {
 
       resources {
         limits = {
-          cpu    = "1000m"
-          memory = "2Gi"
+          cpu    = var.cloud_run_cpu
+          memory = var.cloud_run_memory
         }
         cpu_idle = true
       }
@@ -184,10 +195,10 @@ resource "google_cloud_run_v2_service" "oms" {
           path = "/health"
           port = 8080
         }
-        initial_delay_seconds = 5    # tiempo antes del primer intento
-        period_seconds         = 5    # cada cuánto reintenta
-        timeout_seconds        = 3
-        failure_threshold      = 6    # hasta 6 intentos (~35s) antes de darlo por fallido
+        initial_delay_seconds = 5 # tiempo antes del primer intento
+        period_seconds        = 5 # cada cuánto reintenta
+        timeout_seconds       = 3
+        failure_threshold     = 6 # hasta 6 intentos (~35s) antes de darlo por fallido
       }
 
       # liveness_probe: se ejecuta de forma CONTINUA durante toda la vida de
@@ -237,6 +248,25 @@ resource "google_cloud_run_v2_service" "oms" {
       # El image_sha lo controla el pipeline de despliegue, no terraform apply diario.
       # Si lo dejas sin ignore_changes, cada apply puede revertir un deploy reciente.
       template[0].containers[0].image,
+      # HALLAZGO REAL (Fase 5): sin esto, cada `terraform apply` posterior a
+      # un despliegue de Ansible revertía `traffic` a su forma declarativa
+      # pura (100% a la revisión "LATEST", sin `client`/`revision` fijados),
+      # deshaciendo el control fino de canary/tag que Ansible acaba de
+      # asignar con `gcloud run services update-traffic`. Mismo principio
+      # que con la imagen: Terraform declara la FORMA inicial (el "molde"),
+      # pero quién sirve qué % de tráfico es responsabilidad exclusiva del
+      # pipeline de despliegue una vez el servicio ya existe.
+      traffic,
+      # `client`/`client_version`: metadata que `gcloud run deploy` escribe
+      # automáticamente en cada despliegue de Ansible (identifica qué
+      # herramienta hizo el último cambio) — Terraform no la fija a
+      # propósito y no debe disputarla en cada apply posterior.
+      client,
+      client_version,
+      # `template[0].revision`: nombre autogenerado de la revisión activa
+      # (ej. "oms-staging-00010-zor") — cambia en cada deploy de Ansible,
+      # Terraform nunca lo declara ni debe intentar "vaciarlo" de vuelta.
+      template[0].revision,
     ]
   }
 }
@@ -303,7 +333,7 @@ resource "google_compute_backend_service" "default" {
     cache_key_policy {
       include_host         = true
       include_protocol     = true
-      include_query_string = false   # provisional: se afinará en la Fase 2/bonus
+      include_query_string = false # provisional: se afinará en la Fase 2/bonus
     }
   }
 
@@ -360,9 +390,9 @@ resource "google_compute_global_forwarding_rule" "https" {
 }
 
 # ─── Outputs ──────────────────────────────────────────────────────
-output "cloud_run_url"             { value = google_cloud_run_v2_service.oms.uri }
+output "cloud_run_url" { value = google_cloud_run_v2_service.oms.uri }
 output "cloud_run_service_account" { value = google_service_account.cloud_run.email }
-output "load_balancer_ip"          { value = google_compute_global_address.lb_ip.address }
+output "load_balancer_ip" { value = google_compute_global_address.lb_ip.address }
 # Agregado por el equipo: URL completa del repositorio de Artifact Registry,
 # útil para el pipeline de CI/CD (Fase 6) al hacer `docker push`.
 output "artifact_registry_url" {

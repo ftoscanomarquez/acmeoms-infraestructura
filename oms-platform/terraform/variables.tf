@@ -20,15 +20,15 @@ variable "region" {
     # con las regiones GCP que sí están dentro de la UE (mismo patrón que
     # la validación de `env` de abajo).
     condition = contains([
-      "europe-west1",    # Bélgica
-      "europe-west3",    # Alemania (Frankfurt) — región primaria del proyecto
-      "europe-west4",    # Países Bajos
-      "europe-west8",    # Italia (Milán)
-      "europe-west9",    # Francia (París)
-      "europe-west12",   # Italia (Turín)
+      "europe-west1",      # Bélgica
+      "europe-west3",      # Alemania (Frankfurt) — región primaria del proyecto
+      "europe-west4",      # Países Bajos
+      "europe-west8",      # Italia (Milán)
+      "europe-west9",      # Francia (París)
+      "europe-west12",     # Italia (Turín)
       "europe-southwest1", # España (Madrid)
-      "europe-north1",   # Finlandia
-      "europe-central2", # Polonia (Varsovia) — región DR del bonus multi-region
+      "europe-north1",     # Finlandia
+      "europe-central2",   # Polonia (Varsovia) — región DR del bonus multi-region
     ], var.region)
     error_message = "REG-GDPR-001 exige una región dentro de la UE (europe-west1/3/4/8/9/12, europe-southwest1, europe-north1 o europe-central2) — no basta con que el nombre empiece por 'europe-' (europe-west2/Londres y europe-west6/Zúrich están fuera de la UE)."
   }
@@ -64,8 +64,29 @@ variable "cloud_run_min_instances" {
 
 variable "cloud_run_max_instances" {
   type        = number
-  description = "Máximo de instancias (NFR-SCAL-001 — pico 5×)."
+  description = "Máximo de instancias (NFR-SCAL-001 — pico 5×, sujeto a cuota real de CPU/memoria por región)."
   default     = 10
+}
+
+# HALLAZGO REAL (Fase 5, ver BITACORA-COMANDOS.md § 5.9): antes hardcodeados
+# dentro de modules/compute/main.tf ("1000m"/"2Gi" fijos, iguales en ambos
+# entornos) mientras que ansible/group_vars/production.yml pedía 2000m —
+# Ansible intentaba "corregir" una CPU que Terraform ya había fijado más
+# baja, y la coexistencia de ambas revisiones (la vieja de Terraform + la
+# nueva que Ansible intentaba crear) excedía la cuota CpuAllocPerProjectRegion.
+# Ahora Terraform es la única fuente de verdad de la "forma" del contenedor
+# (mismo principio ya aplicado a min/max_instances); Ansible solo debe
+# COMPARAR contra estos valores exactos, nunca cambiarlos por su cuenta.
+variable "cloud_run_cpu" {
+  type        = string
+  description = "CPU del contenedor de Cloud Run (formato milicores, ej. \"1000m\"). Debe coincidir con ansible/group_vars/<env>.yml."
+  default     = "1000m"
+}
+
+variable "cloud_run_memory" {
+  type        = string
+  description = "Memoria del contenedor de Cloud Run (ej. \"2Gi\"). Debe coincidir con ansible/group_vars/<env>.yml."
+  default     = "2Gi"
 }
 
 variable "image_repo" {

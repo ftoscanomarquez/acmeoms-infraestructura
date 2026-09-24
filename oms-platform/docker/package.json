@@ -1,6 +1,6 @@
 {
   "name": "oms-platform-placeholder",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "NOTA: NO es la aplicacion OMS real. Es un placeholder minimo de infraestructura, creado unicamente para poder construir una imagen Docker desplegable y probar Cloud Run / Load Balancer de verdad en la Fase 3 del trabajo final del Bloque 4 (Plataforma e infraestructura). El enunciado (Trabajo - enunciado.md) es explicito en que implementar la aplicacion NO es parte de este bloque: 'Tu trabajo en este bloque NO es implementar la aplicacion -eso vendra en bloques posteriores-'. Este servidor solo responde /healthz (200 OK) para satisfacer las startup/liveness probes de Cloud Run (modules/compute/main.tf) y el health check del Load Balancer (allow-lb-health-checks en modules/network/main.tf).",
   "main": "server.js",

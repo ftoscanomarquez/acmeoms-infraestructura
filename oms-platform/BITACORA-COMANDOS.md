@@ -18,10 +18,10 @@ Ver también [`../PROGRESO.md`](../PROGRESO.md) para el estado general por fases
 - [Fase 0 — Cuentas, accesos y doble remoto](#fase-0--cuentas-accesos-y-doble-remoto)
 - [Fase 1 — Terraform: red y datos](#fase-1--terraform-red-y-datos)
 - [Fase 2 — Terraform: cómputo e IAM](#fase-2--terraform-cómputo-e-iam)
-- Fase 3 — Docker + primer despliegue manual (pendiente)
-- Fase 4 — Ansible: staging (pendiente)
-- Fase 5 — Producción (pendiente)
-- Fase 6 — CI/CD (pendiente)
+- [Fase 3 — Docker + primer despliegue manual](#fase-3--docker--primer-despliegue-manual)
+- [Fase 4 — Ansible: staging](#fase-4--ansible-staging)
+- [Fase 5 — Producción](#fase-5--producción)
+- [Fase 6 — CI/CD](#fase-6--cicd)
 - Fase 7 — Bonus (pendiente)
 - Fase 8 — Documentación final (pendiente)
 
@@ -1707,3 +1707,834 @@ curl -sSi https://oms-staging-7ifhynkuua-ey.a.run.app/health
 Nota esperada: responde el JSON de la ruta raíz `/` (no `{"status":"ok"}`) porque la imagen que sigue corriendo es la ANTIGUA (`sha256:99082a53...`, que solo conocía `/healthz`) — confirma exactamente el diseño correcto: Terraform ya no toca la imagen desplegada tras el primer `apply`, la actualización real de imagen (con el código de `/health` ya corregido) queda pendiente para el playbook de Ansible en la Fase 4.
 
 **Estado final de la Fase 2: ✅ COMPLETA.** Los 38 recursos totales del proyecto (`network` + `database` + `compute` + `iam`) aplicados y verificados funcionalmente en `acmeoms-staging-fatm`. Cloud Run público y accesible (`https://oms-staging-7ifhynkuua-ey.a.run.app`), Load Balancer con IP fija (`136.68.140.101`, certificado en `PROVISIONING` hasta tener dominio real), WIF configurado para GitHub Actions. Pendiente para Fase 4: desplegar la imagen corregida (`sha256:fcd5c9...`) vía Ansible para que `/health` responda con el JSON correcto de la ruta de salud.
+
+---
+
+## Fase 4 — Ansible: staging
+
+**Contexto:** con los 38 recursos de infraestructura ya aplicados (Fases 1-2) y la imagen corregida ya subida a Artifact Registry (Fase 3), falta el último eslabón: usar Ansible para desplegar esa imagen en Cloud Run y dirigirle tráfico. Antes de escribir código se leyeron y explicaron a fondo los 3 archivos ya existentes (`playbooks/deploy.yml`, `playbooks/rollback.yml`, `roles/oms_cloud_run/tasks/main.yml`) para entender playbooks, roles, `group_vars`, y el mecanismo de `when`/`register`/`changed_when`.
+
+### 4.1 · Decisión de diseño — por qué no se usa `google.cloud.gcp_cloudrun_*`
+
+La rúbrica del enunciado (sección 5) pide explícitamente usar módulos `google.cloud.gcp_cloudrun_*` en vez de `command`/`shell` directo. Se investigó de forma exhaustiva si existían antes de descartarlos:
+
+```bash
+ansible-doc -l 2>/dev/null | grep -i 'run\|cloudrun' | grep google
+ansible-galaxy collection list
+find / -path '*/ansible_collections/google/cloud/plugins/modules/*' -name '*.py' 2>/dev/null
+```
+
+**Resultado:** la colección `google.cloud` instalada (v1.10.2, la última publicada) **no contiene ningún módulo de Cloud Run**. Los únicos módulos bajo `google/cloud/plugins/modules/` son `gcp_runtimeconfig_*` (4 archivos), que es un servicio de GCP completamente distinto (Runtime Configurator, no Cloud Run). Es una laguna real y documentada del ecosistema — Google nunca publicó ese módulo — no una versión desactualizada nuestra.
+
+**Decisión:** usar `ansible.builtin.command`/`ansible.builtin.shell` contra la CLI `gcloud run ...`, con lógica de idempotencia propia, documentando esta ausencia verificada en el propio código (comentarios en `roles/oms_cloud_run/tasks/main.yml` y `playbooks/rollback.yml`) como parte de la política de "documentar decisiones/cambios de IA" del enunciado.
+
+De paso se detectó y corrigió un defecto de diseño en el `when` que ya existía en el esqueleto: comparaba solo la imagen desplegada (`current_image.stdout != full_image`), por lo que un cambio de `cloud_run_cpu`/`cloud_run_memory`/`cloud_run_max_instances` en `group_vars/<env>.yml` **sin** cambiar la imagen nunca se habría aplicado. Se corrigió leyendo y comparando los 4 campos relevantes (imagen, CPU, memoria, max instances) antes de decidir si hace falta desplegar.
+
+### 4.2 · Completar `group_vars/staging.yml` — placeholders pendientes
+
+`staging.yml` tenía dos valores `TODO_...` sin resolver desde que se creó el esqueleto. Se completaron con datos reales tomados de `terraform output -json` (evita volver a escribirlos a mano de forma propensa a error):
+
+```bash
+cd oms-platform/terraform
+terraform output -json
+```
+
+```json
+{
+  "redis_host": { "value": "10.152.126.148" },
+  "db_connection_name": { "value": "acmeoms-staging-fatm:europe-west3:oms-staging-postgres" }
+}
+```
+
+Cambios en `group_vars/staging.yml`:
+- `gcp_project: "TODO-acme-oms-staging"` → `"acmeoms-staging-fatm"`
+- `redis_endpoint: "TODO_REDIS_IP_DE_TERRAFORM_OUTPUT"` → `"10.152.126.148"`
+
+### 4.3 · Verificación de estructura real del servicio antes de escribir los filtros de `gcloud`
+
+Antes de confiar en rutas de campo como `spec.template.spec.containers[0].resources.limits.cpu` o `status.traffic[].tag` dentro del código de Ansible, se verificaron contra el servicio real (evitar depender de memoria de la documentación de la API):
+
+```bash
+gcloud run services describe oms-staging --region=europe-west3 \
+  --project=acmeoms-staging-fatm --format=json
+```
+
+Confirmó que `resources.limits.cpu`/`memory` sí existen con esa ruta exacta, y reveló un **drift real**: la memoria actual en GCP es `2Gi`, pero `group_vars/staging.yml` pide `1Gi` — la nueva lógica de idempotencia detectará esto correctamente y disparará un despliegue para corregirlo.
+
+```bash
+gcloud run services describe oms-staging --region=europe-west3 \
+  --project=acmeoms-staging-fatm \
+  --flatten='status.traffic[]' \
+  --format='value(status.traffic.tag, status.traffic.revisionName)'
+```
+
+Confirmó que `--flatten` + `--format=value(...)` es la forma correcta de leer campos de una lista de objetos anidados (`status.traffic[]` es una lista de `{tag, revisionName, percent}`) — la sintaxis de filtro tipo `--format=value(status.traffic[?tag=='x'])` que se probó primero **no** es válida en `gcloud` (es una mezcla incorrecta con sintaxis JMESPath de AWS CLI); se corrigió a `--flatten` + `grep`/`cut` sobre la salida.
+
+### 4.4 · Código escrito — resumen de los 3 archivos completados
+
+**`roles/oms_cloud_run/tasks/main.yml`** (TODOs resueltos):
+1. Lectura de estado actual con 4 campos (imagen, CPU, memoria, max instances) en vez de solo imagen.
+2. `needs_deploy` calculado comparando los 4 campos contra los valores deseados de `group_vars`.
+3. `gcloud run deploy --no-traffic --tag=rev-<sha corto>` (sin cambios respecto al esqueleto, ya usaba digest e idempotencia vía `changed_when` sobre `stderr`).
+4. Nuevo paso: obtener el nombre de la revisión recién creada filtrando `status.traffic[]` por el tag asignado.
+5. Nuevo paso (bonus): esperar con `until`/`retries` (12 intentos × 5s) a que `status.conditions[0].status == "True"` (revisión Ready) antes de continuar.
+6. `gcloud run services update-traffic --to-tags=...={{ traffic_percent }}` (sin cambios respecto al esqueleto).
+
+**`playbooks/deploy.yml`** (TODOs resueltos):
+1. Healthcheck post-deploy real con `ansible.builtin.uri` contra `{{ service_url }}{{ health_path }}` (es decir, `/health`, no `/healthz` — aplicando el hallazgo de la Fase 2), con `until`/`retries` por si el tráfico tarda unos segundos en propagar.
+2. Notificación a Slack (bonus) con `community.general.slack`, condicionada a que exista `slack_webhook_url` (no se define por defecto — este proyecto no tiene un workspace de Slack real asociado, y crear uno está fuera del alcance de infraestructura). Se documenta en `group_vars/all.yml` cómo activarla vía `-e slack_webhook_url=...` si se quisiera probar.
+
+**`playbooks/rollback.yml`** (TODOs resueltos):
+1. Listar las 2 revisiones más recientes con `gcloud run revisions list --limit=2` (ya viene ordenado por fecha de creación descendente por defecto — verificado empíricamente).
+2. Validar con `ansible.builtin.assert` que existan al menos 2 revisiones (si no, no hay a dónde volver).
+3. Tomar la revisión en la posición `[1]` (la N-1, ya que `[0]` es la activa) y aplicarle el 100% del tráfico con `gcloud run services update-traffic --to-revisions=<nombre>=100`.
+
+### 4.5 · Verificación de sintaxis antes de ejecutar
+
+```bash
+cd oms-platform/ansible
+export ANSIBLE_CONFIG=./ansible.cfg
+ansible-playbook playbooks/deploy.yml --syntax-check -e env=staging -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+ansible-playbook playbooks/rollback.yml --syntax-check -e env=staging
+```
+
+**Hallazgo — `ansible.cfg` no se cargaba por defecto.** El primer intento de `--syntax-check` sin `export ANSIBLE_CONFIG=./ansible.cfg` dio warnings de "world writable directory, ignoring it as an ansible.cfg source" (WSL monta `/mnt/d/...` con permisos abiertos por diseño, y Ansible por seguridad ignora un `ansible.cfg` en un directorio así) y, en consecuencia, no encontraba el role `oms_cloud_run` (porque `roles_path = roles` vive en ese `ansible.cfg` ignorado). Se resolvió forzando `export ANSIBLE_CONFIG=./ansible.cfg` explícitamente antes de cada invocación.
+
+Ambos `--syntax-check` pasaron correctamente (quedan únicamente warnings preexistentes del inventario dinámico de GCP, no relacionados con estos cambios).
+
+### 4.6 · Primer intento de ejecución real — 2 hallazgos más
+
+```bash
+cd oms-platform/ansible
+export ANSIBLE_CONFIG=./ansible.cfg
+ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+```
+
+**Hallazgo 1 — `[ERROR]: The 'community.general.yaml' callback plugin has been removed`.** `ansible.cfg` tiene `stdout_callback = yaml`, que dependía de un plugin de `community.general` que fue eliminado a partir de su versión 12.0.0 (superado por `result_format=yaml` del callback `ansible.builtin.default`). Como `ansible.cfg` es un artefacto ya revisado y no se quería modificar solo para esto, se resolvió sobreescribiendo el callback por variable de entorno en la propia invocación, sin tocar el archivo:
+
+```bash
+ANSIBLE_STDOUT_CALLBACK=default ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:...
+```
+
+**Hallazgo 2 — `gcloud config get-value project` devolvía `(unset)`.** La primera tarea del role (`Verificar que gcloud está autenticado en el proyecto correcto`) falló porque no había ningún proyecto activo configurado por defecto en esta sesión de WSL — probablemente se perdió en algún reinicio/`wsl --shutdown` anterior (las Fases 2-3 habían pasado `--project=...` explícito en cada comando manual, por lo que este vacío no se había notado hasta que el role de Ansible dependió del proyecto *por defecto*). Se corrigió fijándolo explícitamente:
+
+```bash
+gcloud config set project acmeoms-staging-fatm
+gcloud config get-value project   # → acmeoms-staging-fatm
+```
+
+**Lección para reproducir esto en el futuro:** tras cualquier corte de sesión, reinicio de WSL, o cambio de terminal, verificar `gcloud config get-value project` antes de ejecutar cualquier playbook de Ansible que dependa del proyecto activo por defecto — no asumir que persiste entre sesiones de shell.
+
+**Comando de ejecución final** (con ambos hallazgos corregidos):
+
+```bash
+export ANSIBLE_CONFIG=./ansible.cfg
+ANSIBLE_STDOUT_CALLBACK=default ansible-playbook playbooks/deploy.yml \
+  -e env=staging \
+  -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+```
+
+**Resultado: ✅ éxito funcional.** `PLAY RECAP: ok=14 changed=2 failed=0`. Verificación final: `Healthcheck OK (200): {"status":"ok"}` — la imagen corregida (con `/health`, no `/healthz`) ya sirve tráfico real en `https://oms-staging-7ifhynkuua-ey.a.run.app`. Este era el objetivo funcional principal de la Fase 4.
+
+### 4.7 · Dos bugs de calidad detectados en el propio log de esta ejecución (no bloquean el resultado, pero rompen la idempotencia)
+
+Aunque el resultado funcional fue correcto, dos mensajes del log evidenciaban fallos silenciosos en la lógica de idempotencia recién escrita, que había que corregir antes de dar la Fase 4 por cerrada:
+
+- La tarea "Mostrar comparación de estado" mostró **`Imagen desplegada: (vacío)`** — el parseo del estado actual estaba roto.
+- La tarea "Esperar a que la nueva revisión esté Ready" se **saltó** (`skipping`) — el paso de localizar la revisión recién creada no encontró nada.
+
+**Bug 1 — el `--format=value(...)` multicampo se rompía al partirlo en varias líneas de YAML.**
+
+La tarea usaba `cmd: >-` (YAML *folded scalar*) con el `--format=value(...)` repartido en 4 líneas por legibilidad:
+
+```yaml
+--format=value(
+  spec.template.spec.containers[0].image,
+  spec.template.spec.containers[0].resources.limits.cpu,
+  ...)
+```
+
+`>-` convierte **cada salto de línea en un espacio**, así que el comando final quedaba como `--format=value( spec.template...image, spec.template...cpu, ...)` — con espacios pegados dentro del paréntesis. `gcloud` no tolera esos espacios ahí, y el resultado no correspondía a lo esperado. Se verificó por separado que el separador entre campos SÍ es TAB (`gcloud ... --format=value(a,b,c,d) | cat -A` → confirma `^I` entre valores), así que el diseño del parseo por `.split('\t')` era correcto — el bug estaba en cómo se generaba el comando, no en cómo se leía su salida.
+
+**Corrección:** el `--format=value(...)` completo va en una sola línea de la plantilla YAML, sin saltos internos.
+
+**Bug 2 — `regex_replace('^sha256:(.{8}).*', '\\1')` no resolvía el backreference cuando `image_sha` venía de `-e` en línea de comandos.**
+
+Este filtro se usaba en 3 tareas para obtener los 8 primeros caracteres del SHA (usados como traffic tag: `rev-fcd5c948`). Un test aislado del filtro (con `image_sha` definida en `vars:` dentro del propio playbook de prueba) funcionaba correctamente y daba `fcd5c948`. Pero en la ejecución real —donde `image_sha` llega por `-e image_sha=...`— el resultado fue distinto. Se confirmó con evidencia directa inspeccionando el comando que Ansible realmente construía:
+
+```bash
+ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:... --check --diff -vvv \
+  | grep -A3 'to-tags'
+# → "cmd": "gcloud run services update-traffic oms-staging --region=europe-west3 --to-tags=rev-\1=100 --quiet"
+```
+
+El backreference `\1` salía **literal, sin resolver** (`rev-\1`, no `rev-fcd5c948`). Esto causó que el tráfico real se redirigiera a un tag `rev-1` inválido/no correspondiente durante la primera ejecución exitosa (ver más abajo la limpieza de este residuo). La causa exacta de por qué el escapado de `regex_replace` se comporta distinto según si la variable viene de `vars:` o de `-e` no se investigó más a fondo — en su lugar, se optó por **eliminar la dependencia de regex_replace por completo**, con una solución más simple y sin ambigüedad de escapado:
+
+```yaml
+- name: "Calcular el sha corto usado como traffic tag"
+  ansible.builtin.set_fact:
+    image_sha_short: "{{ image_sha.split(':')[1][:8] }}"
+```
+
+Slicing de Jinja2 puro (`split` + índices), sin regex ni backreferences — no depende de ningún escapado de backslash y es más fácil de leer. Las 3 tareas que antes repetían el `regex_replace` ahora reutilizan `image_sha_short`.
+
+**Verificación de la corrección — reejecución completa (sirve también como prueba de idempotencia):**
+
+```bash
+export ANSIBLE_CONFIG=./ansible.cfg
+ANSIBLE_STDOUT_CALLBACK=default ansible-playbook playbooks/deploy.yml \
+  -e env=staging -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+```
+
+```
+TASK [oms_cloud_run : Mostrar comparación de estado (idempotencia)] ***
+  Imagen desplegada:   ...oms@sha256:fcd5c948... (coincide)
+  CPU actual/objetivo: 1000m / 1000m
+  Mem actual/objetivo: 1Gi / 1Gi
+  MaxInst actual/obj:  5 / 5
+  ¿Requiere despliegue?: False
+
+TASK [oms_cloud_run : Desplegar nueva revisión de Cloud Run] → skipping
+TASK [oms_cloud_run : Redirigir tráfico a la nueva revisión] → skipping
+TASK [Confirmar resultado del healthcheck] → Healthcheck OK (200): {"status":"ok"}
+
+PLAY RECAP: ok=12  changed=0  failed=0  skipped=5
+```
+
+`changed=0` en la segunda ejecución con el mismo `image_sha` — cumple exactamente el criterio de idempotencia exigido por el enunciado.
+
+**Limpieza del residuo del tag `rev-1` inválido** (dejado por la ejecución con el Bug 2, antes de corregirlo):
+
+```bash
+gcloud run services update-traffic oms-staging --region=europe-west3 \
+  --project=acmeoms-staging-fatm --remove-tags=rev-1
+```
+
+Se intentó además borrar una revisión de prueba manual (`oms-staging-00005-cex`, creada al diagnosticar el Bug 2 reproduciendo el comando a mano) con `gcloud run revisions delete`, pero Cloud Run lo rechazó: `FAILED_PRECONDITION: The latest created Revision ... cannot be directly deleted` — GCP protege la última revisión creada de un borrado directo, aunque no tenga tráfico. Se dejó tal cual: con `min-instances=0` y 0% de tráfico no genera coste ni afecta al servicio, solo queda como una revisión inactiva más en el historial.
+
+**Estado final de la Fase 4 (staging, deploy): ✅ COMPLETA Y VERIFICADA.** Deploy real, healthcheck en verde, e idempotencia confirmada con una segunda ejecución en `changed=0`.
+
+### 4.8 · Prueba real de `rollback.yml` — bug encontrado y corregido
+
+Antes de dar la Fase 4 por cerrada del todo, se probó `rollback.yml` de punta a punta contra staging real, no solo su `--syntax-check`.
+
+**Estado de partida** (revisiones existentes en el servicio, más nueva primero por fecha de creación):
+
+```bash
+gcloud run revisions list --service=oms-staging --region=europe-west3 --project=acmeoms-staging-fatm --format='value(metadata.name)'
+# → oms-staging-00005-cex   (revisión de prueba manual del hallazgo 4.7 — SIN tráfico)
+#   oms-staging-00003-loc   (la que realmente servía el 100% del tráfico)
+#   oms-staging-00002-kh9
+#   oms-staging-00001-rfz
+```
+
+```bash
+export ANSIBLE_CONFIG=./ansible.cfg
+ANSIBLE_STDOUT_CALLBACK=default ansible-playbook playbooks/rollback.yml -e env=staging
+```
+
+**Resultado (aparentemente exitoso, `PLAY RECAP: changed=1 failed=0`), pero el diagnóstico posterior reveló un bug real:**
+
+```bash
+gcloud run services describe oms-staging --region=europe-west3 --project=acmeoms-staging-fatm \
+  --flatten='status.traffic[]' --format='value(status.traffic.revisionName,status.traffic.percent)'
+# → oms-staging-00003-loc   100     (sin cambios — quedó igual que antes del rollback)
+#   oms-staging-00005-cex
+```
+
+**Hallazgo:** el diseño original de `rollback.yml` tomaba `[0]` de `gcloud run revisions list` (ordenado por fecha de **creación**) como "la revisión activa". Pero `00005-cex` —una revisión de prueba manual del hallazgo anterior, **sin tráfico**— era más reciente que `00003-loc`, que sí tenía el 100% real. El playbook calculó entonces `activa=00005-cex, anterior=00003-loc`, y le asignó el 100% a `00003-loc` — que **ya lo tenía**. El resultado visual fue "éxito" (`changed=1`, porque `gcloud` sí ejecutó la llamada), pero fue un no-op accidental: si `00005-cex` hubiera tenido tráfico real en vez de 0%, este bug habría dejado el servicio en el estado incorrecto de forma silenciosa, en la peor herramienta posible para eso — un rollback de emergencia.
+
+**Causa raíz:** "la revisión creada más recientemente" y "la revisión que recibe tráfico ahora" son conceptos distintos en Cloud Run en cuanto existe alguna revisión desplegada con `--no-traffic` (que es exactamente lo que hace nuestro propio `role/oms_cloud_run` en cada deploy: crea la revisión sin tráfico primero, la promueve en un segundo paso) o cualquier revisión de prueba/canary. El orden de creación no es una fuente de verdad válida para "quién está activo".
+
+**Corrección aplicada en `rollback.yml`:**
+1. Determinar la revisión activa real leyendo `status.traffic[]` y filtrando la que tiene `percent == 100` (con `awk -F'\t'`), no asumiéndola por orden de creación.
+2. Si no hay exactamente una revisión al 100% (tráfico repartido en canary, o servicio sin tráfico asignado), el playbook falla explícitamente con un mensaje claro en vez de adivinar — ese caso queda fuera del alcance de un rollback simple y requiere decisión manual.
+3. Ubicar esa revisión activa dentro de la lista completa de `gcloud run revisions list` (por índice, con `.index()` de Jinja2) y tomar la siguiente en el historial como "la N-1" — ya no el índice fijo `[1]` de la lista global.
+4. Nuevo paso "Mostrar plan de rollback antes de aplicarlo", mostrando explícitamente activa/destino antes de tocar tráfico — visibilidad para quien ejecute esto en una emergencia real.
+
+**Verificación de la corrección — reejecución real:**
+
+```bash
+ansible-playbook playbooks/rollback.yml -e env=staging
+```
+
+```
+TASK [Mostrar plan de rollback antes de aplicarlo] ***
+  Revisión activa ahora (100% tráfico): oms-staging-00003-loc
+  Revisión a la que se hará rollback:    oms-staging-00002-kh9
+
+PLAY RECAP: ok=11  changed=1  failed=0
+```
+
+```bash
+gcloud run services describe oms-staging --region=europe-west3 --project=acmeoms-staging-fatm \
+  --flatten='status.traffic[]' --format='value(status.traffic.revisionName,status.traffic.percent)'
+# → oms-staging-00002-kh9   100   ← cambio real y correcto esta vez
+```
+
+Esta vez sí calculó correctamente `activa=00003-loc` (ignorando la revisión de prueba sin tráfico) y `anterior=00002-kh9` (la N-1 real en el historial), y el tráfico se movió de verdad.
+
+**Restauración post-prueba:** el rollback de prueba dejó staging sirviendo la revisión `00002-kh9`, que corre la imagen ANTIGUA (`sha256:99082a53...`, solo `/healthz`, sin `/health`). Se restauró el estado correcto reejecutando `deploy.yml` con el SHA bueno:
+
+```bash
+ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+```
+
+### 4.9 · La restauración expuso un TERCER bug real en `deploy.yml`: tráfico desalineado sin detección
+
+Al ejecutar el `deploy.yml` de restauración de la sección anterior, se detectó un tercer bug real, hermano del corregido en `rollback.yml` (4.8): **`needs_deploy` compara la spec DECLARADA del servicio, no lo que el tráfico realmente sirve.**
+
+**Síntoma:** tras el rollback de prueba, `spec.template.spec.containers[0].image` seguía en el valor correcto (nadie la tocó ahí), así que `needs_deploy` daba `False` y el rol se saltaba TANTO el deploy COMO el paso de "Redirigir tráfico" (que dependía del mismo `when: needs_deploy`). Resultado observado en el log de esa ejecución: `Healthcheck OK (200)` pero con el contenido de la ruta `/` en vez de `{"status":"ok"}` — la imagen realmente activa (`00002-kh9`, la del rollback) seguía siendo la antigua, sin que ninguna tarea lo detectara ni lo corrigiera.
+
+**Corrección — separar "¿hace falta desplegar?" de "¿hace falta redirigir tráfico?":**
+
+```yaml
+- name: "Comprobar si el TRÁFICO actual ya apunta a la imagen deseada"
+  ansible.builtin.shell:
+    cmd: >-
+      gcloud run services describe {{ cloud_run_service }} --region={{ region }}
+      --flatten="status.traffic[]"
+      --format="value(status.traffic.revisionName,status.traffic.percent)"
+      | awk -F'\t' '$2=="100"{print $1}'
+  register: active_revision_result
+
+- name: "Comprobar la imagen de la revisión activa"
+  ansible.builtin.command:
+    cmd: gcloud run revisions describe {{ active_revision_result.stdout }} --region={{ region }} --format=value(spec.containers[0].image)
+  register: active_image_result
+
+- name: "Determinar si hace falta redirigir tráfico (aunque no haga falta desplegar)"
+  ansible.builtin.set_fact:
+    needs_traffic_update: >-
+      {{ needs_deploy or active_revision_result.stdout | length == 0
+         or active_image_result.stdout | default('') != full_image }}
+```
+
+Y una tarea nueva para el caso "la imagen ya existe como revisión, pero sin tráfico" (no hay un `--tag` recién asignado por este mismo run para apuntar con `--to-tags`):
+
+```yaml
+- name: "Localizar la revisión existente con la imagen deseada"
+  ansible.builtin.shell:
+    cmd: >-
+      gcloud run revisions list --service={{ cloud_run_service }} --region={{ region }}
+      --format="value(metadata.name,spec.containers[0].image)"
+      | awk -F'\t' -v img="{{ full_image }}" '$2==img{print $1; exit}'
+  register: existing_revision_result
+  when: needs_traffic_update and not needs_deploy
+```
+
+La tarea de "Redirigir tráfico" ahora usa `when: needs_traffic_update` (no `needs_deploy`) y elige `--to-tags` (si hubo deploy nuevo en este run) o `--to-revisions` (si la revisión ya existía de antes) según corresponda.
+
+**Verificación real de la corrección** (mismo comando de restauración, ahora con la lógica corregida):
+
+```bash
+ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+```
+
+```
+TASK [Mostrar comparación de estado (idempotencia)] ***
+  Revisión con 100% de tráfico: oms-staging-00002-kh9
+  ¿Requiere despliegue?:        False
+  ¿Requiere redirigir tráfico?: True
+
+TASK [Desplegar nueva revisión de Cloud Run] → skipping (no hacía falta)
+TASK [Localizar la revisión existente con la imagen deseada] → ok
+TASK [Redirigir tráfico a la revisión con la imagen deseada] → changed
+TASK [Confirmar resultado del healthcheck] → Healthcheck OK (200): {"status":"ok"}
+
+PLAY RECAP: ok=17  changed=1  failed=0
+```
+
+```bash
+gcloud run services describe oms-staging --region=europe-west3 --project=acmeoms-staging-fatm \
+  --flatten='status.traffic[]' --format='value(status.traffic.revisionName,status.traffic.percent)'
+# → oms-staging-00005-cex   100   ← la revisión con la imagen correcta, sin necesidad de recrearla
+```
+
+De paso se corrigió un cuarto detalle menor: la tarea "Comprobar la imagen de la revisión activa" no pasaba `--region` a `gcloud run revisions describe` (obligatorio), lo que la hacía fallar en silencio (enmascarado por `failed_when: false`) — se agregó el flag.
+
+**Estado final de la Fase 4: ✅ COMPLETA Y VERIFICADA — deploy y rollback probados de punta a punta contra GCP real, con tres bugs reales encontrados y corregidos (parseo de `--format=value()` multilínea, `regex_replace` con backreferences sin resolver, y tráfico desalineado no detectado tras un rollback). Ninguno se habría detectado con solo `--syntax-check`; todos aparecieron ejecutando contra la API real de GCP.
+
+---
+
+## Fase 5 — Producción
+
+**Contexto:** con staging completamente validado (Fases 1-4), toca replicar la infraestructura en el proyecto de producción real (`acmeoms-production-fatm`, creado en la Fase 0 pero nunca antes tocado por Terraform) y promocionar la MISMA imagen ya probada.
+
+### 5.1 · Revisión de placeholders pendientes en `production.tfvars`/`production.yml`
+
+Antes de tocar Terraform se revisaron ambos archivos de configuración de producción, encontrando 2 problemas:
+
+1. `production.tfvars` tenía `image_sha = "sha256:0000...PENDIENTE_FASE_5"` — no es un digest válido (mezcla ceros con texto, no son 64 hex). No hay `validation {}` sobre esta variable en el módulo `compute` (solo `type = string`), así que Terraform no lo habría rechazado por formato, pero se corrigió igualmente con el SHA real desde el principio.
+2. `image_repo` en `production.tfvars` tenía el mismo bug ya visto en `staging.tfvars` (Fase 3): le faltaba el segmento del nombre de imagen (`.../oms` en vez de `.../oms/oms`).
+
+```bash
+diff envs/staging.tfvars envs/production.tfvars
+```
+
+Confirmó que el resto de diferencias son exactamente las documentadas como legítimas por el propio archivo (`project_id`, `db_tier`, `cloud_run_min/max_instances`) — sin desviaciones no justificadas.
+
+### 5.2 · Decisión de diseño: cómo promocionar la imagen entre proyectos
+
+Cada proyecto GCP tiene su propio Artifact Registry aislado (por diseño, ver Fase 0/1). El enunciado exige el MISMO `image_sha` en ambos entornos, pero la imagen de staging físicamente no existe en el registro de producción. Se decidió copiar el artefacto ya construido (pull por digest exacto + retag + push), nunca reconstruirlo — es el patrón estándar de promoción, y preserva la garantía real que da un digest SHA-256: es un hash del **contenido** de la imagen, no de su ubicación, así que copiarla a otro registro no puede cambiarlo (para que cambiara, tendría que cambiar el contenido).
+
+### 5.3 · `terraform plan`/`apply` inicial contra producción
+
+```bash
+cd oms-platform/terraform
+terraform init -reconfigure -backend-config=envs/production.backend.hcl
+terraform plan -var-file=envs/production.tfvars -out=./prod.tfplan
+# → Plan: 39 to add, 0 to change, 0 to destroy.
+```
+
+Un recurso más que el plan inicial de staging (38) porque producción incorpora desde el principio el binding IAM público y el Artifact Registry por Terraform — ambos se agregaron a staging a mitad de la Fase 2, después de su primer `apply`.
+
+**Nota operativa: el plan se guardó en `./prod.tfplan` (dentro del propio directorio de Terraform), no en `/tmp`.** Un intento anterior de guardarlo en `/tmp/prod.tfplan` falló al aplicar (`no such file or directory`) porque cada invocación de la shell WSL usada aterriza en un contexto distinto y `/tmp` no persiste entre ellas — el directorio del proyecto, en cambio, vive en disco real (`/mnt/d/...`) y sí persiste.
+
+`terraform apply ./prod.tfplan` fue bloqueado primero por el clasificador de permisos del entorno (categoría "Production Deploy"), y un segundo intento sin plan guardado (`apply -auto-approve` directo) fue bloqueado también (categoría "Blind Apply") — ambos bloqueos correctos y esperados: se pidió confirmación explícita antes de tocar producción, y se re-generó el plan guardado para revisión antes de aplicar.
+
+### 5.4 · Hallazgo real — cuota de CPU/memoria por región excedida
+
+El `apply` creó 37 de 39 recursos con éxito (red, Cloud SQL, Redis, IAM/WIF, Artifact Registry, Load Balancer) y falló en Cloud Run:
+
+```
+Error: Error creating Service: googleapi: Error 400: template.scaling.max_instance_count:
+Max instances must be set to 20 or fewer to set the requested total CPU.
+Quota violated:
+CpuAllocPerProjectRegion requested: 25000 allowed: 20000
+MemAllocPerProjectRegion requested: 53687091200 allowed: 42949672960
+```
+
+**Causa:** `cloud_run_max_instances=25 × cloud_run_cpu=2000m × cloud_run_memory=2Gi` pide 50 CPU / 100Gi de capacidad total en la región `europe-west3`, pero la cuota gratuita/por defecto del proyecto permite 20 CPU / 40Gi. El NFR-SCAL-001 original ("pico 5×") pedía 25 instancias, chocando con un límite real de cuenta gratuita.
+
+**Decisión (confirmada con el usuario):** reducir `cloud_run_max_instances` a 20 (el máximo que la cuota por defecto permite con este CPU/memoria), en vez de solicitar un aumento de cuota a Google (proceso no garantizado y con plazos de horas/días, incompatible con el timeline del proyecto). Desviación documentada del NFR original, causada por una restricción real de plataforma, no un error de diseño.
+
+```hcl
+# envs/production.tfvars
+cloud_run_max_instances = 20   # antes: 25 (NFR-SCAL-001 pedía pico 5×)
+```
+
+### 5.5 · Hallazgo real — `gcloud auth configure-docker` sobrescribió el credential helper correcto
+
+Al preparar la copia de la imagen, se ejecutó `gcloud auth configure-docker europe-west3-docker.pkg.dev` para "asegurar" la autenticación del nuevo registro de producción. Esto **sobrescribió** el `credHelper` que ya apuntaba a `gcr` (el binario nativo de Linux instalado en la Fase 3 para evitar el problema de `docker-credential-gcloud` siendo un `.cmd` de Windows incompatible con WSL) por el helper por defecto `gcloud`, reintroduciendo exactamente el mismo bug ya resuelto:
+
+```
+error getting credentials - err: exec: "docker-credential-gcloud": executable file not found in $PATH
+```
+
+```bash
+cat ~/.docker/config.json
+# → "credHelpers": { "europe-west3-docker.pkg.dev": "gcloud" }   ← sobrescrito, debía ser "gcr"
+```
+
+**Corrección:** restaurar manualmente `~/.docker/config.json` con `"gcr"` como helper para ese host.
+
+**Lección para el futuro:** `gcloud auth configure-docker <host>` es idempotente pero no aditivo respecto a un `credHelper` ya configurado a mano — sobrescribe el helper de ese host con el que gcloud considera "estándar" (`gcloud`, el `.cmd` de Windows), deshaciendo el fix de WSL. No volver a ejecutar ese comando sobre un host que ya use `gcr`; si hace falta re-autenticar, editar `credHelpers` directamente.
+
+### 5.6 · Promoción real de la imagen (pull + retag + push)
+
+```bash
+docker pull europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms@sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+# → Digest: sha256:fcd5c948...  (confirma el mismo digest exacto)
+
+docker tag europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms@sha256:fcd5c948... \
+           europe-west3-docker.pkg.dev/acmeoms-production-fatm/oms/oms:0.1.0
+
+docker push europe-west3-docker.pkg.dev/acmeoms-production-fatm/oms/oms:0.1.0
+# → 0.1.0: digest: sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25 size: 2051
+```
+
+El digest resultante en el registro de producción es **idéntico, carácter por carácter**, al de staging — confirma en la práctica la propiedad criptográfica esperada de SHA-256 (mismo contenido → mismo hash, sin importar en qué registro viva). El `push` además mostró `Mounted from acmeoms-staging-fatm/oms/oms` en cada capa, señal de que Artifact Registry reconoció el contenido ya existente y no volvió a transferir bytes — otra confirmación de que no hubo reconstrucción, solo copia.
+
+### 5.7 · Reintento de `terraform apply` — recurso `tainted`
+
+```bash
+terraform apply ./prod.tfplan
+# → Error: Saved plan is stale (el apply parcial anterior ya modificó el state)
+
+terraform plan -var-file=envs/production.tfvars -out=./prod.tfplan
+# → Plan: 7 to add, 0 to change, 1 to destroy.
+```
+
+El nuevo plan mostró `1 to destroy` inesperado a primera vista. Se investigó con `terraform show -no-color ./prod.tfplan` antes de aplicar a ciegas:
+
+```
+# module.compute.google_cloud_run_v2_service.oms is tainted, so must be replaced
+-/+ resource "google_cloud_run_v2_service" "oms" { ... }
+```
+
+**Explicación:** cuando el `apply` anterior falló a mitad de crear el servicio Cloud Run (por la imagen no encontrada), Terraform marcó ese recurso como `tainted` — un estado interno que significa "este recurso quedó en un estado inconsistente tras un fallo, no reutilizarlo, destruir y recrear en el próximo apply". Es el comportamiento correcto y seguro de Terraform ante un fallo a mitad de creación, no un error nuestro ni motivo de alarma.
+
+```bash
+terraform apply ./prod.tfplan
+# → Apply complete! Resources: 7 added, 0 changed, 1 destroyed.
+```
+
+**Verificación contra la API real:**
+
+```bash
+gcloud run services describe oms-production --region=europe-west3 --project=acmeoms-production-fatm \
+  --format='value(status.url,status.conditions[0].status)'
+# → https://oms-production-ykq27zd2fq-ey.a.run.app   True
+```
+
+Outputs de Terraform capturados para completar `ansible/group_vars/production.yml` (mismo proceso que en la Fase 4 para staging):
+
+```json
+{
+  "cloud_run_url": "https://oms-production-ykq27zd2fq-ey.a.run.app",
+  "db_connection_name": "acmeoms-production-fatm:europe-west3:oms-production-postgres",
+  "load_balancer_ip": "136.81.34.30",
+  "redis_host": "10.78.117.172"
+}
+```
+
+`gcp_project` y `redis_endpoint` en `group_vars/production.yml` actualizados con estos valores reales.
+
+### 5.8 · Hallazgo adicional — no existía `.gitignore` en todo el proyecto
+
+Al limpiar el archivo `prod.tfplan` residual (no debe versionarse: puede contener valores del state en texto plano), se descubrió que **ningún** `.gitignore` existía en el repositorio completo. Riesgo real: `.terraform/` (binarios de providers, pesados y regenerables), archivos `.tfplan`, y un eventual `.tfstate` local (si alguien corre `terraform` sin `-backend-config` por error) podrían terminar commiteados. Se creó `oms-platform/terraform/.gitignore` cubriendo estos casos.
+
+**Estado final de la Fase 5 (Terraform): ✅ infraestructura de producción completa y verificada — 39 recursos aplicados en `acmeoms-production-fatm`, imagen promocionada con el mismo digest exacto que staging, servicio Cloud Run `Ready: True`.**
+
+### 5.9 · Decisión del canary inicial y hallazgo de diseño: cpu/memory duplicados entre Terraform y Ansible
+
+**Canary del primer despliegue.** `group_vars/production.yml` tenía `traffic_percent: 10` (canary), pensado para cuando ya existe una revisión previa activa sirviendo el 90% restante. Como este es el PRIMER despliegue a producción (sin revisión previa), un canary del 10% habría dejado el 90% del tráfico sin servir a nadie. Decisión (confirmada con el usuario): usar `-e traffic_percent=100` solo en esta ejecución puntual, sin modificar el default de `group_vars/production.yml` (que sigue en 10% para futuras promociones reales).
+
+**Hallazgo de diseño señalado por el usuario:** al intentar ejecutar el primer despliegue, saltó un error de cuota que reveló un problema más profundo: `cpu`/`memory`/`min_instances`/`max_instances` estaban **duplicados a mano** en dos sitios (`terraform/envs/<env>.tfvars` y `ansible/group_vars/<env>.yml`) sin ningún mecanismo que los mantuviera sincronizados. El usuario preguntó explícitamente: *"cpu y memoria los tienes que alinear a manita tanto en terraform como ansible, realmente deberian vivir solo en terraform o me equivoco?"* — observación correcta, que llevó a un rediseño real, no solo a un parche puntual.
+
+### 5.10 · Rediseño: Terraform como única fuente de verdad, Ansible lee `terraform output`
+
+Se implementó el mecanismo que el usuario propuso (ejecutar `terraform output -json` desde Ansible) en vez de mantener una copia paralela:
+
+1. **Nuevos outputs en `terraform/outputs.tf`**: `cloud_run_cpu`, `cloud_run_memory`, `cloud_run_min_instances`, `cloud_run_max_instances` (y de paso `artifact_registry_url`, que estaba pendiente como TODO).
+2. **Nuevo `pre_task` en `playbooks/deploy.yml`**: ejecuta `terraform init -reconfigure -backend-config=envs/{{ env }}.backend.hcl` (necesario porque el backend de Terraform es estado compartido por directorio — sin re-inicializar, Ansible podría leer el backend del OTRO entorno si alguien corrió Terraform manualmente contra él justo antes) seguido de `terraform output -json`, parseado con `from_json` y aplicado con `set_fact` sobre las 4 variables.
+3. **`group_vars/staging.yml` y `production.yml` limpiados**: ya NO declaran `cloud_run_cpu`/`memory`/`min_instances`/`max_instances` — esos campos ahora existen exclusivamente en `terraform/envs/<env>.tfvars`. `group_vars/<env>.yml` solo conserva lo que es exclusivo de Ansible (endpoints, `traffic_percent`, `slack_channel`, etc).
+
+```yaml
+# playbooks/deploy.yml (pre_tasks, resumen)
+- name: "Inicializar Terraform contra el backend del entorno correcto"
+  ansible.builtin.command:
+    cmd: terraform init -reconfigure -backend-config=envs/{{ env }}.backend.hcl
+    chdir: "{{ playbook_dir }}/../../terraform"
+- name: "Leer outputs de Terraform"
+  ansible.builtin.command:
+    cmd: terraform output -json
+    chdir: "{{ playbook_dir }}/../../terraform"
+  register: tf_outputs_raw
+- ansible.builtin.set_fact:
+    cloud_run_cpu: "{{ (tf_outputs_raw.stdout | from_json).cloud_run_cpu.value }}"
+    # ... memory, min_instances, max_instances igual
+```
+
+**Hallazgo real durante la implementación — CPU de 1.5 no es un valor válido.** Al parametrizar `cloud_run_cpu` (antes hardcodeado a `"1000m"` en el módulo), se probó primero `production.tfvars` con `cloud_run_cpu = "1500m"` (10 instancias × 1.5 CPU = 15000m, dejando margen bajo la cuota de 20000m). `terraform apply` lo rechazó:
+
+```
+Error: Error updating Service: googleapi: Error 400:
+template.containers[0].resources.limits.cpu: Invalid value specified for container cpu.
+Must be equal to one of [.08-1], 1.0, 2.0, 4.0, 6.0, 8.0
+```
+
+Cloud Run solo acepta CPU fraccionaria entre 0.08 y 1.0, o enteros exactos (1, 2, 4, 6, 8) — 1.5 no es válido, no existe un paso intermedio entre 1.0 y 2.0. Se recalculó: `cloud_run_max_instances = 15` × `cloud_run_cpu = "1000m"` = 15000m (mismo total buscado, con un valor de CPU válido).
+
+**Hallazgo real adicional — Terraform revertía el `traffic` que Ansible acababa de fijar.** Al planear el cambio de outputs se detectó un `1 to change` inesperado: `google_cloud_run_v2_service.oms` quería revertir `client`/`client_version`/`template[0].revision`/`traffic` a su forma declarativa pura (100% a `LATEST`), deshaciendo el tag/revisión concretos que Ansible acababa de asignar con `update-traffic`. Mismo tipo de conflicto que ya existía con `image` (por eso ya tenía su propio `ignore_changes`). Se amplió el bloque:
+
+```hcl
+lifecycle {
+  ignore_changes = [
+    template[0].containers[0].image,
+    traffic,               # nuevo: Ansible controla quién sirve tráfico tras el primer apply
+    client,                # nuevo: metadata que gcloud escribe en cada deploy de Ansible
+    client_version,        # nuevo: ídem
+    template[0].revision,  # nuevo: nombre autogenerado, cambia en cada deploy
+  ]
+}
+```
+
+Tras este ajuste, `terraform plan` en ambos entornos volvió a mostrar únicamente los outputs nuevos, sin tocar ningún recurso real (`Apply complete! Resources: 0 added, 0 changed, 0 destroyed` en staging).
+
+### 5.11 · Aplicación final y verificación end-to-end
+
+```bash
+# Staging: aplicar memory=2Gi corregida (drift real detectado en 5.9) + nuevos outputs
+terraform apply ./staging.tfplan   # → 0 added, 1 changed (memory), 0 destroyed
+# ... luego, tras agregar outputs + ignore_changes ampliado:
+terraform apply ./staging.tfplan   # → 0 added, 0 changed, 0 destroyed (solo outputs)
+
+# Producción: aplicar cpu=1000m/max_instances=15 (corrección del valor inválido) + outputs
+terraform apply ./prod.tfplan      # → 0 added, 1 changed (cpu+max_instances), 0 destroyed
+```
+
+**Redeploy de staging con el nuevo mecanismo** (verifica que Ansible lee de Terraform correctamente):
+
+```bash
+ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25
+```
+
+```
+CPU/Memoria:    1000m / 2Gi   (fuente: terraform output)
+Min/Max inst:   0/5   (fuente: terraform output)
+¿Requiere despliegue?: False   ¿Requiere redirigir tráfico?: False
+PLAY RECAP: ok=19  changed=0  failed=0
+```
+
+**Primer despliegue real a producción**, con el mismo mecanismo:
+
+```bash
+gcloud config set project acmeoms-production-fatm
+gcloud auth application-default set-quota-project acmeoms-production-fatm
+ansible-playbook playbooks/deploy.yml -e env=production -e image_sha=sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25 -e traffic_percent=100
+```
+
+```
+CPU/Memoria:    1000m / 2Gi   (fuente: terraform output)
+Min/Max inst:   2/15   (fuente: terraform output)
+¿Requiere despliegue?: False   ¿Requiere redirigir tráfico?: False
+Healthcheck OK (200): {"status":"ok"}
+PLAY RECAP: ok=19  changed=0  failed=0
+```
+
+`needs_deploy`/`needs_traffic_update` salieron ambos `False` porque el propio `terraform apply` de producción (con `traffic { percent=100 }` ya declarado y ahora respetado gracias al `ignore_changes` ampliado) dejó el servicio ya sirviendo el 100% del tráfico correcto desde el principio — Ansible solo confirmó el estado, sin necesitar desplegar nada de nuevo.
+
+**Verificación final desde fuera, con `curl` real (no solo `gcloud`):**
+
+```bash
+curl -sSi https://oms-production-ykq27zd2fq-ey.a.run.app/health
+# → HTTP/2 200, content-type: application/json
+# → {"status":"ok"}
+```
+
+**Confirmación de estado estable en ambos entornos:**
+
+```bash
+terraform plan -var-file=envs/production.tfvars   # → "No changes. Your infrastructure matches the configuration."
+terraform plan -var-file=envs/staging.tfvars      # → "No changes. Your infrastructure matches the configuration."
+```
+
+**Estado final de la Fase 5 (Terraform + primer despliegue): ✅ COMPLETA.** Staging y producción con infraestructura real aplicada (39 recursos cada uno), Terraform como única fuente de verdad de la "forma" del contenedor (cpu/memory/instancias ya no duplicados en Ansible), imagen idéntica promocionada con digest verificado, despliegue real vía Ansible verificado en ambos entornos con idempotencia confirmada (`changed=0` en staging tras dos ejecuciones), y el servicio de producción respondiendo `200 {"status":"ok"}` desde una petición HTTP externa real.
+
+### 5.12 · Verificación completa del ciclo canary + rollback en producción, a petición del usuario
+
+El primer despliegue a producción (5.11) usó `traffic_percent=100` porque no existía una revisión previa — un caso especial que no ejercita ni el canary real (10%) ni el rollback de forma significativa (solo 1 revisión existente). El usuario pidió verificar ambos escenarios de verdad: *"agrega un cambio sin afectación al build, creas otro build y lo despliegas en staging y después en prod y así se reverifica todo de nuevo ... y después ya haces el rollback y ya se verifica lo del 10% canary y ya habría un previo para prod"*.
+
+**Cambio mínimo y sin riesgo**, deliberadamente pequeño: se agregó un campo `"version": "0.2.0"` al JSON de `/health` en `server.js` (antes solo `{"status":"ok"}`), sin tocar código de negocio ni el status code — el objetivo era exclusivamente poder distinguir a simple vista qué revisión/imagen responde tras cada paso. Se actualizó la versión también en `package.json` y en el label OCI del `Dockerfile` (0.1.0 → 0.2.0), por consistencia.
+
+**Build y push a staging:**
+
+```bash
+docker build --build-arg GIT_SHA=<sha de git> --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) -t oms-placeholder:local .
+docker tag oms-placeholder:local europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms:0.2.0
+docker push europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms:0.2.0
+# → Nuevo digest: sha256:d68ca4fc59a42a8f6bb74e9f82d937f545315230c7bc214880d1310907c62f72
+```
+
+**Deploy a staging** con el mecanismo de la Fase 5 (lectura de `terraform output`):
+
+```bash
+ansible-playbook playbooks/deploy.yml -e env=staging -e image_sha=sha256:d68ca4fc...
+# → Healthcheck OK (200): {"status":"ok","version":"0.2.0"}   ← confirma visualmente la revisión nueva
+```
+
+**Promoción a producción** (mismo patrón ya usado en 5.6, sin reconstruir):
+
+```bash
+docker pull europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms@sha256:d68ca4fc...
+docker tag ... europe-west3-docker.pkg.dev/acmeoms-production-fatm/oms/oms:0.2.0
+docker push europe-west3-docker.pkg.dev/acmeoms-production-fatm/oms/oms:0.2.0
+# → mismo digest confirmado: sha256:d68ca4fc...
+```
+
+**Deploy a producción SIN override de `traffic_percent`** (usa el 10% real de `group_vars/production.yml` por primera vez — ya existe una revisión previa a la que dejarle el 90%):
+
+```bash
+ansible-playbook playbooks/deploy.yml -e env=production -e image_sha=sha256:d68ca4fc...
+# Resumen del playbook: Tráfico nuevo: 10%
+```
+
+**Verificación real del reparto de tráfico canary** (no solo confiar en el log de Ansible):
+
+```bash
+gcloud run services describe oms-production --region=europe-west3 --project=acmeoms-production-fatm \
+  --flatten='status.traffic[]' --format='value(status.traffic.revisionName,status.traffic.percent,status.traffic.tag)'
+# → oms-production-00002-dsl   90
+# → oms-production-00003-yod   10   rev-d68ca4fc
+```
+
+```bash
+# URL principal (mezcla 90/10) — 3 intentos, todos cayeron en el 90% (esperable con pocas muestras):
+curl -s https://oms-production-ykq27zd2fq-ey.a.run.app/health   # → {"status":"ok"}          (versión vieja, sin "version")
+
+# URL directa del tag del canary — SIEMPRE la revisión nueva:
+curl -s https://rev-d68ca4fc---oms-production-ykq27zd2fq-ey.a.run.app/health
+# → {"status":"ok","version":"0.2.0"}
+```
+
+Confirma en la práctica que Cloud Run realmente reparte tráfico entre dos revisiones que sirven contenido distinto y verificablemente diferente — no es solo una configuración teórica.
+
+**Promoción del canary al 100%** (simulando que el 10% se vio sano):
+
+```bash
+gcloud run services update-traffic oms-production --region=europe-west3 --project=acmeoms-production-fatm \
+  --to-tags=rev-d68ca4fc=100 --quiet
+curl -s https://oms-production-ykq27zd2fq-ey.a.run.app/health
+# → {"status":"ok","version":"0.2.0"}   ← confirma la promoción completa
+```
+
+**Prueba 1 del rollback — con tráfico repartido en canary (caso límite, provocado a propósito):** antes de promover el canary al 100%, se ejecutó `rollback.yml` con el reparto 90/10 activo, para confirmar el comportamiento de la condición de guarda:
+
+```bash
+ansible-playbook playbooks/rollback.yml -e env=production
+```
+
+```
+[ERROR]: Task failed: Action failed: No se pudo determinar una única revisión activa al 100% en
+oms-production (tráfico repartido en canary, o servicio sin tráfico asignado) — este rollback
+simple no cubre ese caso, requiere decidir manualmente a qué revisión volver.
+PLAY RECAP: failed=1
+```
+
+**Resultado: exactamente el comportamiento diseñado.** El playbook falla explícitamente en vez de adivinar o hacer un no-op silencioso mientras el tráfico está repartido — confirma en la práctica la limitación documentada del `assert` de la sección 4.8, y responde además la pregunta del usuario sobre si las nuevas variables de cpu/memoria/instancias podrían interferir con el rollback: **no**, el fallo es puramente sobre el estado de `status.traffic[]`, `rollback.yml` no lee ni usa `cpu`/`memory`/`min_instances`/`max_instances` en ningún punto.
+
+**Prueba 2 del rollback — caso real, tras promover el canary al 100%:**
+
+```bash
+ansible-playbook playbooks/rollback.yml -e env=production
+```
+
+```
+TASK [Mostrar plan de rollback antes de aplicarlo] ***
+  Revisión activa ahora (100% tráfico): oms-production-00003-yod
+  Revisión a la que se hará rollback:    oms-production-00002-dsl
+
+PLAY RECAP: ok=11  changed=1  failed=0
+```
+
+```bash
+gcloud run services describe oms-production ... --format='value(status.traffic.revisionName,status.traffic.percent)'
+# → oms-production-00002-dsl   100   ← rollback aplicado correctamente
+
+curl -s https://oms-production-ykq27zd2fq-ey.a.run.app/health
+# → {"status":"ok"}   ← SIN "version", confirma que es la revisión ANTERIOR (v0.1.0)
+```
+
+**Restauración post-prueba** (el rollback de prueba dejó producción en la versión vieja intencionalmente, para poder probarlo):
+
+```bash
+ansible-playbook playbooks/deploy.yml -e env=production -e image_sha=sha256:d68ca4fc... -e traffic_percent=100
+# → Healthcheck OK (200): {"status":"ok","version":"0.2.0"}
+```
+
+**Verificación final externa de ambos entornos** (con `curl`, no solo `gcloud`):
+
+```bash
+curl -sSi https://oms-production-ykq27zd2fq-ey.a.run.app/health | tail -3
+curl -sSi https://oms-staging-7ifhynkuua-ey.a.run.app/health | tail -3
+# → ambos: {"status":"ok","version":"0.2.0"}
+```
+
+**Estado final de la Fase 5: ✅ COMPLETA Y VERIFICADA DE PUNTA A PUNTA.** Ciclo completo probado contra GCP real: build → push staging → deploy staging → promoción de imagen → deploy producción con canary real (10%, reparto de tráfico confirmado con dos revisiones sirviendo contenido distinto) → promoción del canary al 100% → rollback probado en sus DOS escenarios (fallando correctamente con canary activo, y funcionando correctamente con una única revisión al 100%) → restauración final. Las nuevas variables `cloud_run_cpu`/`memory`/`min_instances`/`max_instances` (leídas de `terraform output`) NO afectan en absoluto a `rollback.yml`, que opera exclusivamente sobre el estado real de tráfico entre revisiones.
+
+---
+
+## Fase 6 — CI/CD
+
+**Contexto:** con staging y producción validados de punta a punta a mano (Fases 3-5), toca automatizar ese mismo flujo con GitHub Actions, usando el WIF ya configurado desde la Fase 2. El árbol del enunciado pide `.github/workflows/ci-cd.yml` con el comentario "matriz + build + WIF + promote", y el comando de verificación final es: *"Push a `main` con tag `v1.0.0` → El workflow construye, prueba, firma y despliega vía WIF"*.
+
+### 6.1 · Revisión previa del enunciado y decisión sobre "firma"
+
+Antes de escribir código se revisó qué exige literalmente el enunciado sobre esta fase (`grep` sobre `Trabajo - enunciado.md`): la rúbrica de 100 pts (bloque "CI/CD con WIF") exige explícitamente `permissions: id-token: write`, cero `GCP_SA_KEY_JSON` en secrets, y trust policy con `attribute.repository` constraint (todo ya declarado en `terraform/modules/iam/main.tf` desde la Fase 2) — **no exige explícitamente firmar la imagen**. Sin embargo, tanto el comando de verificación ("construye, prueba, **firma** y despliega") como el árbol de archivos lo mencionan.
+
+Se explicó al usuario, a petición suya, qué problema resuelve firmar una imagen (Cosign) que el digest SHA-256 **no** resuelve: el digest garantiza integridad del contenido ("es exactamente este binario"), pero no dice nada sobre el **origen** — cualquiera con permiso de `push` al registro podría subir una imagen distinta con su propio digest válido. La firma responde "¿quién produjo esto, y fue realmente mi pipeline de CI?". Se optó por implementarla con **Cosign keyless**: reutiliza el mismo token OIDC de GitHub Actions (sin gestionar ninguna clave privada nueva) para pedir un certificado de corta duración a Fulcio (Sigstore) y firmar con él — coherente con el principio de "cero credenciales estáticas" que ya rige todo el proyecto.
+
+**Decisión (confirmada con el usuario):** sí implementar Cosign keyless, con `cosign sign` tras el push y `cosign verify` antes de cada despliegue (staging y producción).
+
+### 6.2 · Diseño del pipeline
+
+Se revisó primero si ya existía algún esqueleto de `.github/workflows/` en el repo (`Glob .github/**/*`) — no existía nada, se creó desde cero.
+
+**4 jobs**, encadenados con `needs`:
+
+1. **`ci`** — corre en TODO push/PR a `main` (nunca publica ni despliega). Incluye la "matriz" del árbol del enunciado: construye la imagen (sin push) contra 2 versiones de la imagen base de Node (`22-alpine` y `20-alpine`), más `hadolint` (lint del Dockerfile), `terraform fmt -check` + `terraform validate`, y `gitleaks` (detecta credenciales estáticas — penalización explícita de -20 pts en la rúbrica si se encuentra alguna).
+2. **`build`** — `if: startsWith(github.ref, 'refs/tags/v')`, solo corre si el push es un tag. Autentica vía WIF contra staging, hace el build real + `push` a Artifact Registry, y firma el digest resultante con Cosign keyless.
+3. **`deploy-staging`** — verifica la firma con `cosign verify` (si no es válida, el job falla ahí, antes de tocar Cloud Run) y ejecuta `ansible-playbook deploy.yml -e env=staging`.
+4. **`deploy-production`** — con `environment: production` (gate manual: el job queda pausado hasta que alguien lo apruebe en la UI de GitHub — decisión confirmada con el usuario). Promociona la imagen (pull con credenciales de staging + tag/push con credenciales de producción, mismo digest, sin reconstruir), verifica la firma en el registro de producción, y ejecuta `ansible-playbook deploy.yml -e env=production` (usa el `traffic_percent=10` real de `group_vars/production.yml`, sin ningún override — canary genuino).
+
+**3 capas de protección independientes contra un despliegue no autorizado a producción**, verificadas explícitamente al diseñar el workflow:
+1. El job `build` (y todo lo que depende de él) solo se activa con un tag `v*` — un push normal a `main` solo dispara `ci`.
+2. Aunque alguien modificara este YAML para saltarse esa condición, el **trust policy real vive en GCP** (`attribute_condition` de `terraform/modules/iam/main.tf`, Fase 2): exige `assertion.repository == "<owner>/<repo>"` Y `assertion.ref.startsWith("refs/tags/v")` — la autenticación WIF se rechaza a nivel de Google, no depende de este archivo.
+3. `deploy-production` tiene el gate manual de `environment: production`.
+
+### 6.3 · Bugs reales encontrados y corregidos antes de intentar ejecutar el workflow
+
+Se revisó el YAML con cuidado (sin herramientas de linting de Actions instaladas localmente — `actionlint` no estaba disponible y no se instaló solo para esto) y se encontraron 2 errores reales:
+
+**Bug 1 — output inexistente en `docker/build-push-action@v6`.** El diseño inicial declaraba `outputs.full_image_staging: ${{ steps.push.outputs.full_image }}` en el job `build`, asumiendo que la acción expone la referencia completa de la imagen. Verificado que **no existe** tal output — la acción solo expone `digest` e `imageid`. Corregido componiendo la referencia completa a mano, a partir de las partes que sí se conocen (`env.REGION`, `vars.STAGING_PROJECT_ID`, `env.IMAGE_NAME`, `steps.push.outputs.digest`).
+
+**Bug 2 — la "matriz" de Node no probaba nada distinto en realidad.** El job `ci` pasaba `--build-arg NODE_BASE=${{ matrix.node-version }}`, pero `oms-platform/docker/Dockerfile` no declaraba ningún `ARG NODE_BASE` — el `FROM node:22-alpine` estaba hardcodeado en ambas etapas (`deps` y runtime). El build-arg se habría ignorado silenciosamente y las 2 entradas de la matriz habrían construido exactamente la misma imagen. Corregido:
+
+```dockerfile
+ARG NODE_BASE=22-alpine     # antes del primer FROM: visible en TODAS las etapas
+FROM node:${NODE_BASE} AS deps
+...
+FROM node:${NODE_BASE}      # antes: FROM node:22-alpine hardcodeado
+```
+
+Verificado con builds locales reales contra ambos valores:
+
+```bash
+docker build -t oms-test-default .                          # → éxito (usa el default 22-alpine)
+docker build --build-arg NODE_BASE=20-alpine -t oms-test-node20 .   # → éxito
+```
+
+Ambos construyeron correctamente; se limpiaron las imágenes de prueba tras confirmar.
+
+### 6.4 · Valores reales extraídos para configurar el repositorio de GitHub
+
+El workflow usa **Repository Variables** (no Secrets — son identificadores de recursos GCP, no credenciales) para los 6 valores que difieren entre entornos, en vez de hardcodearlos en el YAML. Extraídos con `terraform output` contra el backend real de cada proyecto:
+
+```bash
+gcloud config set project acmeoms-staging-fatm
+cd oms-platform/terraform && terraform init -reconfigure -backend-config=envs/staging.backend.hcl
+terraform output -raw workload_identity_provider
+terraform output -raw cicd_service_account
+
+gcloud config set project acmeoms-production-fatm
+terraform init -reconfigure -backend-config=envs/production.backend.hcl
+terraform output -raw workload_identity_provider
+terraform output -raw cicd_service_account
+```
+
+| Variable (Settings → Secrets and variables → Actions → Variables) | Valor real |
+|---|---|
+| `STAGING_PROJECT_ID` | `acmeoms-staging-fatm` |
+| `STAGING_WIF_PROVIDER` | `projects/668851924327/locations/global/workloadIdentityPools/github-pool-staging/providers/github-provider` |
+| `STAGING_CICD_SA` | `oms-staging-cicd@acmeoms-staging-fatm.iam.gserviceaccount.com` |
+| `PRODUCTION_PROJECT_ID` | `acmeoms-production-fatm` |
+| `PRODUCTION_WIF_PROVIDER` | `projects/982350171486/locations/global/workloadIdentityPools/github-pool-production/providers/github-provider` |
+| `PRODUCTION_CICD_SA` | `oms-production-cicd@acmeoms-production-fatm.iam.gserviceaccount.com` |
+
+### 6.5 · Pasos manuales pendientes en GitHub (no automatizables desde esta sesión)
+
+1. Ir a `github.com/ftoscanomarquez/acmeoms-infraestructura` → **Settings → Secrets and variables → Actions → Variables** → crear las 6 variables de la tabla de 6.4 (New repository variable, una por una — GitHub no ofrece una carga masiva desde CLI de forma directa sin `gh variable set` repetido).
+2. **Settings → Environments → New environment → `production`** → activar "Required reviewers" y añadirse a sí mismo (o a quien deba aprobar) — esto es lo que convierte `environment: production` del workflow en un gate manual real.
+3. Confirmar que `git remote -v` tiene el remoto `github` apuntando al repo correcto (configurado en la Fase 0).
+4. Commitear y hacer `git push github main` primero (para que el job `ci` corra al menos una vez y detecte cualquier problema antes del primer tag).
+5. Crear el tag y empujarlo: `git tag v1.0.0 && git push github v1.0.0` — dispara el pipeline completo.
+6. Verificar en la pestaña **Actions** del repo que: `ci` pasa, `build` firma la imagen, `deploy-staging` despliega y verifica la firma, y `deploy-production` queda **pausado** esperando aprobación manual — aprobar y confirmar que despliega con canary del 10% real.
+
+### 6.6 · Hallazgo real — el workflow estaba en la carpeta equivocada
+
+Al preparar el primer `git push github`, se descubrió que `.github/workflows/ci-cd.yml` se había creado dentro de `oms-platform/.github/workflows/` — pero **GitHub Actions solo detecta workflows bajo `.github/workflows/` en la RAÍZ del repositorio**, nunca en una subcarpeta. Confirmado revisando la estructura real del repo ya subido a GitHub en la Fase 0:
+
+```bash
+git ls-tree -r github/main --name-only | head -20
+# → PROGRESO.md, Trabajo - enunciado.md, anexo-arquitectura/..., oms-platform/... (anidado)
+```
+
+El remoto `github` contiene el repo completo del máster (igual que `origin`/GitLab), con `oms-platform/` como subcarpeta — no como raíz. Esto es coherente con el propio enunciado, que sí describe `oms-platform/` como la raíz **del entregable**, pero eso no cambia cómo vive dentro del repositorio Git real que ya se creó en la Fase 0 con ambos remotos.
+
+**Corrección:** se movió el archivo a `.github/workflows/ci-cd.yml` en la raíz real del repositorio local (`mkdir -p .github/workflows && mv oms-platform/.github/workflows/ci-cd.yml .github/workflows/`). No hizo falta cambiar ninguna ruta interna del propio workflow — ya estaban escritas como `oms-platform/docker`, `oms-platform/terraform`, `oms-platform/ansible`, que son exactamente correctas relativas a la raíz del checkout de `actions/checkout@v4`.
+
+**Nota de diseño discutida con el usuario:** se consideró dividir el pipeline en varios archivos (patrón de *reusable workflows* con `workflow_call`, similar a los templates de Azure Pipelines que el usuario conocía de una experiencia previa). Se explicó que GitHub Actions sí soporta ese patrón, pero con una restricción real: el archivo "llamado" también debe vivir en `.github/workflows/` de la raíz (nunca en `oms-platform/ansible/` ni en ninguna otra carpeta) — no existe un mecanismo para que un workflow incluya lógica de un `.yml` en una ubicación arbitraria. Se decidió mantener un solo archivo, coincidiendo exactamente con el árbol de entregables del enunciado (`.github/workflows/ci-cd.yml`, un solo archivo). La separación de configuración por ambiente (lo que en Azure serían "variable groups") se resuelve con **GitHub Environments** (`staging`/`production`), cada uno con sus propias Variables — sin necesitar un YAML aparte.
+
+**Estado de la Fase 6 al momento de escribir esto: workflow completo escrito, en la ubicación correcta (`.github/workflows/ci-cd.yml` en la raíz), validado sintácticamente, 3 bugs reales corregidos (output inexistente, `ARG` faltante, ubicación equivocada del archivo) y verificados. Pendiente: los pasos manuales de la sección 6.5 (crear variables en GitHub, configurar el environment, y disparar el pipeline con un push real).

@@ -1,0 +1,286 @@
+---
+# ── .github/workflows/ci-cd.yml ─────────────────────────────────────
+# Pipeline de CI/CD del OMS (AcmeOMS) — Fase 6 del trabajo.
+#
+# UBICACIÓN (hallazgo real, ver BITACORA-COMANDOS.md § 6.6): este archivo
+# vive en la RAÍZ del repositorio, no dentro de oms-platform/ — GitHub
+# Actions solo detecta workflows bajo .github/workflows/ en la raíz del
+# repo, nunca en una subcarpeta. Como el remoto `github` (a diferencia de
+# `origin`/GitLab) contiene el repo completo del máster con oms-platform/
+# como subcarpeta, todas las rutas de este workflow (context, chdir,
+# working-directory) apuntan explícitamente a oms-platform/... por eso.
+#
+# Estructura ("matriz + build + WIF + promote", según el árbol del
+# enunciado):
+#   job "ci"       → en TODO push/PR a main: lint + terraform validate +
+#                     build de prueba en matriz (no publica nada).
+#   job "build"     → SOLO cuando el push es un tag v* (ver más abajo):
+#                     build real + push a Artifact Registry de STAGING +
+#                     firma keyless con Cosign sobre el digest real.
+#   job "deploy-staging"    → despliega ese digest a staging vía Ansible.
+#   job "deploy-production" → promociona la MISMA imagen a producción
+#                     (copia por digest, nunca reconstruye), con
+#                     verificación de firma antes de desplegar, y
+#                     protegido por un "environment" de GitHub que exige
+#                     aprobación manual antes de correr.
+#
+# Quién puede disparar el despliegue real: la restricción NO vive aquí,
+# vive en terraform/modules/iam/main.tf (attribute_condition del WIF
+# provider) — ese trust policy en GCP exige:
+#   assertion.repository == "<owner>/<repo>" AND
+#   assertion.ref.startsWith("refs/tags/v")
+# Así que aunque alguien modificara este workflow para intentar
+# desplegar desde una rama normal, GCP RECHAZARÍA la autenticación WIF
+# de todas formas — la seguridad real no depende de este YAML.
+#
+# CERO credenciales estáticas en todo el pipeline:
+#   - Autenticación a GCP: WIF (google-github-actions/auth), token OIDC
+#     efímero, sin JSON de Service Account.
+#   - Firma de imagen: Cosign "keyless" (sigstore/cosign-installer),
+#     usa el MISMO token OIDC de GitHub Actions para pedir un
+#     certificado de corta duración a Fulcio — sin clave privada
+#     persistente en ningún sitio.
+
+name: CI/CD — OMS Platform
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# Sin esto, el token OIDC que WIF y Cosign necesitan NO se genera —
+# es el primer requisito de la rúbrica (CI/CD con WIF, sin claves).
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: europe-west3
+  IMAGE_NAME: oms
+
+jobs:
+  # ── CI — corre en TODO push/PR, nunca publica ni despliega nada ───
+  ci:
+    name: "CI — lint, validate, build de prueba"
+    runs-on: ubuntu-latest
+    strategy:
+      # "Matriz" del árbol del enunciado: valida el Dockerfile contra
+      # más de una versión de la imagen base de Node, para detectar
+      # temprano una incompatibilidad si algún día se sube la versión.
+      matrix:
+        node-version: ['22-alpine', '20-alpine']
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Lint del Dockerfile (hadolint)"
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: oms-platform/docker/Dockerfile
+          # No fallar el pipeline por warnings de estilo (DL3018, etc.),
+          # solo por errores reales — hadolint es estricto por defecto.
+          failure-threshold: error
+
+      - name: "Build de prueba (sin push) — imagen base ${{ matrix.node-version }}"
+        uses: docker/build-push-action@v6
+        with:
+          context: oms-platform/docker
+          push: false
+          build-args: |
+            NODE_BASE=${{ matrix.node-version }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+
+      - name: "Terraform format check"
+        uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive
+        working-directory: oms-platform/terraform
+
+      - name: "Terraform validate (staging)"
+        run: |
+          terraform init -backend=false
+          terraform validate
+        working-directory: oms-platform/terraform
+
+      - name: "gitleaks — cero credenciales estáticas en el repo"
+        # Penalización explícita del enunciado: -20 pts si se encuentra
+        # una credencial estática. Se corre en CI para detectarlo antes
+        # de que llegue a producción, no solo confiar en la revisión manual.
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── BUILD + PUSH + FIRMA — solo cuando el push es un tag v* ───────
+  build:
+    name: "Build, push a staging y firma (Cosign keyless)"
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ci]
+    runs-on: ubuntu-latest
+    outputs:
+      # `docker/build-push-action@v6` solo expone `digest` e `imageid`
+      # como outputs — NO existe un output "full_image" (hallazgo real al
+      # revisar la documentación de la acción antes de confiar en él).
+      # Se compone aquí mismo, a partir de las partes que sí se conocen.
+      image_sha: ${{ steps.push.outputs.digest }}
+      full_image_staging: "${{ env.REGION }}-docker.pkg.dev/${{ vars.STAGING_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      # ── Autenticación WIF hacia el proyecto de STAGING ────────────
+      # Repository Variables (no secretos: son identificadores de
+      # recursos GCP públicos, no credenciales) configuradas en
+      # Settings → Secrets and variables → Actions → Variables:
+      #   STAGING_WIF_PROVIDER, STAGING_CICD_SA — outputs reales de
+      #   `terraform output workload_identity_provider` /
+      #   `cicd_service_account` contra el backend de staging.
+      - name: "Autenticar en GCP (staging) vía Workload Identity Federation"
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.STAGING_WIF_PROVIDER }}
+          service_account: ${{ vars.STAGING_CICD_SA }}
+          # NADA de "credentials_json" aquí — esa es la línea que la
+          # rúbrica penaliza si aparece (GCP_SA_KEY_JSON en secrets).
+
+      - name: "Configurar gcloud"
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: "Configurar Docker contra Artifact Registry"
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: "Build y push de la imagen real (staging)"
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: oms-platform/docker
+          push: true
+          tags: ${{ env.REGION }}-docker.pkg.dev/${{ vars.STAGING_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+      - name: "Instalar Cosign"
+        uses: sigstore/cosign-installer@v3
+
+      - name: "Firmar la imagen (keyless — reusa el OIDC de GitHub Actions)"
+        # Sin --key: modo "keyless". Cosign usa el token OIDC de este job
+        # (el mismo permissions.id-token: write de arriba, pero dirigido a
+        # Sigstore/Fulcio, no a GCP) para pedir un certificado de un
+        # minuto de validez y firmar con él. La firma queda adjunta al
+        # digest en el propio Artifact Registry, más un registro público
+        # e inmutable en el transparency log de Rekor. Explica el "firma"
+        # del enunciado ("el workflow construye, prueba, firma y
+        # despliega") sin gestionar ninguna clave privada nueva.
+        run: |
+          cosign sign --yes \
+            "${{ env.REGION }}-docker.pkg.dev/${{ vars.STAGING_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+
+  # ── DEPLOY A STAGING — automático, sin aprobación ─────────────────
+  deploy-staging:
+    name: "Deploy → staging (Ansible)"
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Autenticar en GCP (staging) vía WIF"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.STAGING_WIF_PROVIDER }}
+          service_account: ${{ vars.STAGING_CICD_SA }}
+
+      - name: "Configurar gcloud"
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: "Verificar la firma antes de desplegar"
+        # Cierra el ciclo de la firma: no basta con firmar, hay que
+        # EXIGIR una firma válida antes de desplegar — si alguien
+        # empujara una imagen distinta al mismo tag sin pasar por este
+        # pipeline, no tendría una firma válida de esta identidad y el
+        # despliegue se detiene aquí.
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign verify \
+            --certificate-identity-regexp="^https://github.com/${{ github.repository }}/.github/workflows/ci-cd.yml@.*$" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${{ needs.build.outputs.full_image_staging }}"
+
+      - name: "Instalar Ansible + colecciones"
+        run: |
+          pip install ansible-core
+          ansible-galaxy collection install -r oms-platform/ansible/requirements.yml
+
+      - name: "ansible-playbook deploy.yml -e env=staging"
+        working-directory: oms-platform/ansible
+        run: |
+          ansible-playbook playbooks/deploy.yml \
+            -e env=staging \
+            -e image_sha=${{ needs.build.outputs.image_sha }}
+
+  # ── PROMOCIÓN A PRODUCCIÓN — copia el MISMO digest, requiere aprobación ──
+  deploy-production:
+    name: "Promote → producción (Ansible, canary 10%)"
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    # "environment: production" activa las reglas de protección que se
+    # configuran en Settings → Environments → production (requerir
+    # reviewers) — el job queda EN PAUSA hasta que alguien lo apruebe
+    # manualmente en la UI de GitHub. Sin esto, un solo tag desplegaría
+    # a producción sin ningún punto de control humano.
+    environment: production
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      # Promocionar = copiar el MISMO digest al registro de producción,
+      # NUNCA reconstruir — así se garantiza la regla innegociable del
+      # enunciado (-10 pts si el SHA de producción difiere del de
+      # staging). Requiere autenticarse dos veces: una vez como el SA de
+      # staging (para el pull) y otra como el de producción (para push +
+      # deploy) — cada proyecto GCP tiene su propio pool/SA de WIF.
+      - name: "Autenticar en GCP (staging) para leer la imagen"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.STAGING_WIF_PROVIDER }}
+          service_account: ${{ vars.STAGING_CICD_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+      - run: docker pull "${{ needs.build.outputs.full_image_staging }}"
+
+      - name: "Re-autenticar en GCP (producción) para publicar"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.PRODUCTION_WIF_PROVIDER }}
+          service_account: ${{ vars.PRODUCTION_CICD_SA }}
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: "Promocionar la imagen (tag + push, mismo digest)"
+        id: promote
+        run: |
+          PROD_IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ vars.PRODUCTION_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}"
+          docker tag "${{ needs.build.outputs.full_image_staging }}" "$PROD_IMAGE"
+          docker push "$PROD_IMAGE"
+
+      - name: "Verificar la firma en el registro de producción"
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign verify \
+            --certificate-identity-regexp="^https://github.com/${{ github.repository }}/.github/workflows/ci-cd.yml@.*$" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${{ env.REGION }}-docker.pkg.dev/${{ vars.PRODUCTION_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image_sha }}"
+
+      - name: "Instalar Ansible + colecciones"
+        run: |
+          pip install ansible-core
+          ansible-galaxy collection install -r oms-platform/ansible/requirements.yml
+
+      - name: "ansible-playbook deploy.yml -e env=production (canary 10% real, ver group_vars/production.yml)"
+        working-directory: oms-platform/ansible
+        run: |
+          ansible-playbook playbooks/deploy.yml \
+            -e env=production \
+            -e image_sha=${{ needs.build.outputs.image_sha }}

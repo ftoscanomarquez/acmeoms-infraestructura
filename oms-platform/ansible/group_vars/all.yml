@@ -21,3 +21,12 @@ container_port: 8080
 
 # Cloud Run service name pattern
 cloud_run_service: "{{ project_prefix }}-{{ env }}"
+
+# Notificación a Slack (bonus, ver playbooks/deploy.yml post_tasks)
+# Deliberadamente NO se define slack_webhook_url aquí: este proyecto no
+# tiene un workspace real de Slack asociado (crear uno es un artefacto
+# ajeno al alcance de infraestructura, ver Trabajo - enunciado.md sección 1).
+# El playbook comprueba `slack_webhook_url is defined` y omite la
+# notificación sin fallar si no se define. Para activarla de verdad, pasar
+# -e slack_webhook_url=https://hooks.slack.com/services/... en la llamada
+# a ansible-playbook (nunca hardcodearlo en el repo).

@@ -32,13 +32,21 @@ const http = require('node:http');
 
 const PORT = process.env.PORT || 8080;
 
+// Cambio deliberadamente mínimo y sin riesgo (Fase 5, verificación completa
+// del ciclo build → deploy staging → deploy producción con canary real →
+// rollback): añade "version" al JSON de /health, únicamente para poder
+// confirmar a simple vista qué revisión/imagen responde realmente tras
+// cada despliegue. No cambia el status code, el content-type, ni la
+// estructura base que ya validan las probes/healthchecks existentes.
+const BUILD_VERSION = '0.2.0';
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     // Endpoint que consultan: el HEALTHCHECK del Dockerfile, las
     // startup_probe/liveness_probe de Cloud Run, y los health checks
     // del Load Balancer (rangos de GFE permitidos por firewall).
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
+    res.end(JSON.stringify({ status: 'ok', version: BUILD_VERSION }));
     return;
   }
 

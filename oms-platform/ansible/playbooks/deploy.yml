@@ -32,6 +32,47 @@
                  -e env=<staging|production> \
                  -e image_sha=sha256:<64 hex chars>
 
+    # ── Leer cpu/memory/min/max_instances DESDE Terraform ──────────
+    # HALLAZGO REAL (Fase 5, ver BITACORA-COMANDOS.md § 5.9/5.10): estos 4
+    # valores vivían duplicados a mano aquí (group_vars/<env>.yml) y en
+    # terraform/envs/<env>.tfvars — nada los mantenía sincronizados, y de
+    # hecho se detectó un drift real de memoria que pasó desapercibido
+    # durante varias fases. Ahora Terraform es la ÚNICA fuente de verdad:
+    # se ejecuta `terraform output -json` contra el backend del entorno
+    # correcto y se sobreescriben aquí las 4 variables, ignorando cualquier
+    # valor que group_vars/<env>.yml pudiera declarar por su cuenta.
+    #
+    # `-reconfigure` es necesario porque el backend de Terraform es estado
+    # compartido por directorio de trabajo: si alguien corrió Terraform
+    # manualmente contra el OTRO entorno justo antes (staging vs producción),
+    # sin -reconfigure Ansible leería ese backend equivocado en silencio.
+    - name: "Inicializar Terraform contra el backend del entorno correcto"
+      ansible.builtin.command:
+        cmd: >-
+          terraform init -reconfigure
+          -backend-config=envs/{{ env }}.backend.hcl
+        chdir: "{{ playbook_dir }}/../../terraform"
+      register: tf_init
+      changed_when: false
+
+    - name: "Leer outputs de Terraform (fuente de verdad de la forma del contenedor)"
+      ansible.builtin.command:
+        cmd: terraform output -json
+        chdir: "{{ playbook_dir }}/../../terraform"
+      register: tf_outputs_raw
+      changed_when: false
+
+    - name: "Sobreescribir cpu/memory/instancias con los valores reales de Terraform"
+      ansible.builtin.set_fact:
+        tf_outputs: "{{ tf_outputs_raw.stdout | from_json }}"
+
+    - name: "Aplicar los valores leídos de Terraform"
+      ansible.builtin.set_fact:
+        cloud_run_cpu: "{{ tf_outputs.cloud_run_cpu.value }}"
+        cloud_run_memory: "{{ tf_outputs.cloud_run_memory.value }}"
+        cloud_run_min_instances: "{{ tf_outputs.cloud_run_min_instances.value }}"
+        cloud_run_max_instances: "{{ tf_outputs.cloud_run_max_instances.value }}"
+
     - name: "Mostrar resumen del despliegue"
       ansible.builtin.debug:
         msg: |
@@ -40,7 +81,8 @@
           ║  Proyecto GCP:   {{ gcp_project }}
           ║  Servicio:       {{ cloud_run_service }}
           ║  Imagen:         {{ image_repo }}@{{ image_sha }}
-          ║  Min/Max inst:   {{ cloud_run_min_instances }}/{{ cloud_run_max_instances }}
+          ║  CPU/Memoria:    {{ cloud_run_cpu }} / {{ cloud_run_memory }}   (fuente: terraform output)
+          ║  Min/Max inst:   {{ cloud_run_min_instances }}/{{ cloud_run_max_instances }}   (fuente: terraform output)
           ║  Tráfico nuevo:  {{ traffic_percent }}%
           ╚═══════════════════════════════════════════════════════════╝
 
@@ -50,13 +92,52 @@
         full_image: "{{ image_repo }}@{{ image_sha }}"
 
   post_tasks:
-    - name: "Verificar healthcheck del servicio desplegado"
-      # TODO(alumno): usa ansible.builtin.uri para hacer GET al /healthz
-      # del Cloud Run y comprobar que responde 200 antes de declarar éxito.
-      ansible.builtin.debug:
-        msg: "TODO: implementar healthcheck post-deploy contra {{ cloud_run_service }}"
+    - name: "Obtener la URL pública del servicio Cloud Run"
+      ansible.builtin.command:
+        cmd: >-
+          gcloud run services describe {{ cloud_run_service }}
+          --region={{ region }}
+          --format=value(status.url)
+      register: service_url
+      changed_when: false
 
-    - name: "Notificar a Slack"
-      # TODO(alumno) [bonus]: notifica al canal correspondiente con el SHA desplegado.
+    - name: "Verificar healthcheck del servicio desplegado"
+      # NOTA: /health, NO /healthz — Google Front End intercepta /healthz
+      # en Cloud Run devolviendo 404 genérico sin llegar al contenedor
+      # (hallazgo real documentado en oms-platform/BITACORA-COMANDOS.md).
+      # Reintenta porque el tráfico puede tardar unos segundos en
+      # propagarse tras el update-traffic anterior.
+      ansible.builtin.uri:
+        url: "{{ service_url.stdout }}{{ health_path }}"
+        status_code: 200
+        return_content: true
+      register: healthcheck
+      until: healthcheck.status == 200
+      retries: 6
+      delay: 5
+
+    - name: "Confirmar resultado del healthcheck"
       ansible.builtin.debug:
-        msg: "TODO: avisar a {{ slack_channel }} de despliegue de {{ image_sha }}"
+        msg: "Healthcheck OK ({{ healthcheck.status }}): {{ healthcheck.content }}"
+
+    - name: "Notificar a Slack" # [bonus]
+      # community.general.slack requiere un webhook incoming configurado en
+      # el workspace de Slack (slack_webhook_url). Como este proyecto no
+      # tiene un workspace real de Slack asociado (fuera del alcance de
+      # infraestructura pura, ver Trabajo - enunciado.md sección 1), la
+      # notificación se deja condicionada a que exista esa variable, para
+      # no romper el playbook en el entorno de evaluación real.
+      community.general.slack:
+        token: "{{ slack_webhook_url }}"
+        msg: ":rocket: Deploy de OMS en *{{ env }}* — servicio `{{ cloud_run_service }}` — imagen `{{ image_sha }}` — healthcheck {{ healthcheck.status }}."
+        channel: "{{ slack_channel }}"
+      when: slack_webhook_url is defined
+      register: slack_result
+      failed_when: false
+
+    - name: "Aviso si no se notificó a Slack"
+      ansible.builtin.debug:
+        msg: >-
+          Slack no configurado (falta slack_webhook_url) — se omite la notificación.
+          Despliegue en {{ env }} de {{ image_sha }} completado igualmente.
+      when: slack_webhook_url is not defined

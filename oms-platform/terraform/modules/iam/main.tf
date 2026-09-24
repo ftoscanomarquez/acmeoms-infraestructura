@@ -2,11 +2,11 @@
 # Workload Identity Federation para que GitHub Actions despliegue
 # SIN claves estáticas (Vídeo 4). Service Accounts con scope mínimo.
 
-variable "project_id"        { type = string }
-variable "env"               { type = string }
-variable "github_repository" { type = string }   # formato "owner/repo"
-variable "cloud_run_sa"      { type = string }   # email del SA del runtime
-variable "labels"            { type = map(string) }
+variable "project_id" { type = string }
+variable "env" { type = string }
+variable "github_repository" { type = string } # formato "owner/repo"
+variable "cloud_run_sa" { type = string }      # email del SA del runtime
+variable "labels" { type = map(string) }
 
 # ─── Workload Identity Pool ──────────────────────────────────────
 resource "google_iam_workload_identity_pool" "github" {

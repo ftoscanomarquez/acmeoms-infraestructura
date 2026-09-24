@@ -2,27 +2,28 @@
 # Tier reducido, autoscaling mínimo, deletion_protection sigue ACTIVADO
 # (es buena práctica protegerlo también en staging).
 
-project_id = "acmeoms-staging-fatm"    # proyecto GCP real de staging (Fase 0)
-region     = "europe-west3"            # REG-GDPR-001
+project_id = "acmeoms-staging-fatm" # proyecto GCP real de staging (Fase 0)
+region     = "europe-west3"         # REG-GDPR-001
 env        = "staging"
 
-vpc_cidr   = "10.20.0.0/16"
+vpc_cidr = "10.20.0.0/16"
 
-db_tier    = "db-custom-2-7680"        # 2 vCPU, 7.5 GB RAM
+db_tier = "db-custom-2-7680" # 2 vCPU, 7.5 GB RAM
 
-cloud_run_min_instances = 0            # escala a cero cuando no hay tráfico
-cloud_run_max_instances = 5            # tope conservador para staging
+cloud_run_min_instances = 0       # escala a cero cuando no hay tráfico
+cloud_run_max_instances = 5       # tope conservador para staging
+cloud_run_cpu           = "1000m" # explícito: antes hardcodeado en el módulo (Fase 5, ver hallazgo)
+cloud_run_memory        = "2Gi"   # debe coincidir con ansible/group_vars/staging.yml
 
-# image_sha REAL (Fase 3): digest obtenido tras `docker push` de un
-# placeholder minimo de infraestructura (oms-platform/docker/server.js —
-# NO es la aplicación OMS real, ver Trabajo - enunciado.md sección 1).
-# Ver oms-platform/BITACORA-COMANDOS.md Fase 3 para el proceso completo.
-# NOTA: este digest ya corresponde a la versión con endpoint /health (no
-# /healthz — ver hallazgo real documentado en BITACORA-COMANDOS.md § 3.3:
-# Google Front End interceptaba /healthz antes de llegar a Cloud Run).
+# image_sha REAL (Fase 5, v0.2.0): digest tras `docker push` del cambio
+# mínimo (server.js: campo "version" en /health) hecho para verificar de
+# punta a punta el ciclo build → deploy staging → deploy producción con
+# canary real → rollback (ver BITACORA-COMANDOS.md Fase 5, verificación
+# final). Recordatorio: este valor solo importa en el PRIMER apply — está
+# en lifecycle.ignore_changes, el despliegue real lo controla Ansible.
 image_repo = "europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms"
-image_sha  = "sha256:fcd5c9483453625e40a4989a2edeee82a9ce6dbc78cef6c54ceabf5bcec82b25"
+image_sha  = "sha256:d68ca4fc59a42a8f6bb74e9f82d937f545315230c7bc214880d1310907c62f72"
 
-deletion_protection = true             # también en staging
+deletion_protection = true # también en staging
 
 github_repository = "ftoscanomarquez/acmeoms-infraestructura"

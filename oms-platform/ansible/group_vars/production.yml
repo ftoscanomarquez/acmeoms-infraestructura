@@ -5,17 +5,25 @@
 # y cada línea explicable en un PR.
 
 env:         "production"
-gcp_project: "TODO-acme-oms-production"
+gcp_project: "acmeoms-production-fatm"
 
-# Capacidad — dimensionada para tráfico real con headroom 30% (NFR-SCAL-002)
-cloud_run_min_instances: 2     # nunca a cero: evita cold starts en producción
-cloud_run_max_instances: 25    # NFR-SCAL-001: pico 5×
-cloud_run_cpu:    "2000m"
-cloud_run_memory: "2Gi"
+# Capacidad de Cloud Run (cpu/memory/min/max_instances): NO se declara aquí.
+# HALLAZGO REAL (Fase 5, ver BITACORA-COMANDOS.md § 5.4/5.9/5.10): NFR-SCAL-001
+# pedía pico 5× (25 instancias a 2000m), pero eso excede la cuota gratuita de
+# CPU por región (CpuAllocPerProjectRegion=20000m), y además Cloud Run solo
+# acepta CPU en {.08-1, 1.0, 2.0, 4.0, 6.0, 8.0} (1500m no es válido). Estos
+# 4 valores vivían duplicados a mano aquí Y en terraform/envs/production.tfvars,
+# sin nada que los mantuviera sincronizados. Ahora playbooks/deploy.yml los
+# LEE directamente de `terraform output -json` en un pre_task — Terraform es
+# la única fuente de verdad. Valor real aplicado: 15 instancias × 1000m CPU
+# = 15000m (25% de margen bajo el límite). Para cambiar capacidad de
+# producción, editar SOLO terraform/envs/production.tfvars + terraform apply.
 
 # Endpoints
+# Valores tomados de `terraform output` (módulo database) tras el apply
+# real de la Fase 5 — ver oms-platform/BITACORA-COMANDOS.md.
 db_instance_connection: "{{ gcp_project }}:{{ region }}:oms-production-postgres"
-redis_endpoint:         "TODO_REDIS_IP_DE_TERRAFORM_OUTPUT_PROD"
+redis_endpoint:         "10.78.117.172"
 
 # Tráfico — promoción gradual (no big-bang en producción)
 # El playbook arranca con 10% y va subiendo si los SLOs aguantan.

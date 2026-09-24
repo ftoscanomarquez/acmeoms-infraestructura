@@ -94,6 +94,8 @@ module "compute" {
   image_sha               = var.image_sha
   cloud_run_min_instances = var.cloud_run_min_instances
   cloud_run_max_instances = var.cloud_run_max_instances
+  cloud_run_cpu           = var.cloud_run_cpu
+  cloud_run_memory        = var.cloud_run_memory
   db_connection_name      = module.database.db_connection_name
   db_secret_id            = module.database.db_password_secret_id
   redis_host              = module.database.redis_host

@@ -4,17 +4,24 @@
 # Cualquier otra cosa que cambie aquí, justifícala en el PR.
 
 env:         "staging"
-gcp_project: "TODO-acme-oms-staging"
+gcp_project: "acmeoms-staging-fatm"
 
-# Capacidad — ajustada a tráfico de QA
-cloud_run_min_instances: 0
-cloud_run_max_instances: 5
-cloud_run_cpu:    "1000m"
-cloud_run_memory: "1Gi"
+# Capacidad de Cloud Run (cpu/memory/min/max_instances): NO se declara aquí.
+# HALLAZGO REAL (Fase 5, ver BITACORA-COMANDOS.md § 5.9/5.10): estos 4
+# valores vivían duplicados a mano en este archivo Y en
+# terraform/envs/staging.tfvars — nada los mantenía sincronizados, y de
+# hecho hubo un drift real (memory quedó en "1Gi" aquí mientras Terraform y
+# el servicio real ya usaban "2Gi", sin que nadie lo notara). Ahora
+# playbooks/deploy.yml los LEE directamente de `terraform output -json` en
+# un pre_task — Terraform es la única fuente de verdad de la "forma" del
+# contenedor. Para cambiar capacidad de staging, editar SOLO
+# terraform/envs/staging.tfvars + terraform apply.
 
 # Endpoints
+# Valores tomados de `terraform output -json` (módulo database) tras el
+# apply real de la Fase 2 — ver oms-platform/BITACORA-COMANDOS.md.
 db_instance_connection: "{{ gcp_project }}:{{ region }}:oms-staging-postgres"
-redis_endpoint:         "TODO_REDIS_IP_DE_TERRAFORM_OUTPUT"
+redis_endpoint:         "10.152.126.148"
 
 # Tráfico
 traffic_percent: 100   # staging recibe el 100% de la nueva revisión inmediatamente

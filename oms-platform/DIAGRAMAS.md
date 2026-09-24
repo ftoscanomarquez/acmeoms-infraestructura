@@ -1,6 +1,6 @@
 # DIAGRAMAS.md — AcmeOMS / oms-platform
 
-> **Documento vivo.** Se actualiza en cada fase del proyecto. La versión actual cubre únicamente lo que está **construido, aplicado y verificado en GCP real** (Fases 1, 2 y 3 — 38 recursos en el proyecto `acmeoms-staging-fatm`). Cuando avancen las Fases 4 (Ansible), 6 (CI/CD) y 7 (bonus), este documento se amplía con los diagramas correspondientes — no se documenta aquí nada que todavía no exista de verdad.
+> **Documento vivo.** Se actualiza en cada fase del proyecto. La versión actual cubre lo que está **construido, aplicado y verificado en GCP real** hasta la Fase 5 inclusive: 39 recursos en cada proyecto (`acmeoms-staging-fatm` y `acmeoms-production-fatm`), despliegue vía Ansible con lectura en vivo de `terraform output`, canary real en producción, y rollback probado deliberadamente contra ambos escenarios (con y sin canary activo). Cuando avance la Fase 6 (CI/CD) y la Fase 7 (bonus), este documento se amplía con los diagramas correspondientes — no se documenta aquí nada que todavía no exista de verdad.
 >
 > Para el detalle de cómo y por qué se construyó cada pieza (incluyendo los hallazgos y correcciones reales del camino), ver [`BITACORA-COMANDOS.md`](BITACORA-COMANDOS.md). Para el estado y las decisiones del proyecto, ver [`../PROGRESO.md`](../PROGRESO.md).
 
@@ -155,6 +155,117 @@ flowchart TB
 
 ---
 
+## 2.bis · Diagrama de flujo — de dónde sale el build y quién lo despliega cada vez
+
+Este diagrama responde a una pregunta distinta de la del diagrama 1: no "qué recursos existen", sino **"quién construye/despliega qué, en qué orden, y qué cambia entre la primera ejecución y las siguientes"**. Cubre las Fases 3-5 completas (Docker, Terraform, Ansible), incluyendo staging vs producción, el caso especial del primer despliegue (sin revisión previa), el canary real del 10% en producción, y el rollback — todo verificado contra GCP real, no solo diseñado en papel.
+
+**Convención de colores de los círculos numerados:**
+- 🔵 **Azul** = pasos de la **corrida inicial** (build + `terraform apply` la primera vez que existe el servicio)
+- 🟠 **Naranja** = pasos de **corridas subsecuentes** (Ansible desplegando una imagen nueva sobre un servicio que ya existe)
+- 🔴 **Rojo** = pasos de **rollback** (recuperación ante un despliegue con problemas)
+
+```mermaid
+flowchart TB
+    subgraph build["① BUILD — una sola vez por versión, fuera de Terraform/Ansible"]
+        code["Código fuente<br/>(server.js, Dockerfile)"]
+        dockerbuild(("① docker build"))
+        digest["Imagen con digest único<br/>sha256:d68ca4fc..."]
+        pushstg(("② docker push<br/>→ Artifact Registry STAGING"))
+        code --> dockerbuild --> digest --> pushstg
+    end
+
+    subgraph tf_init["② TERRAFORM — SOLO la corrida inicial crea el servicio"]
+        tfvars["terraform/envs/staging.tfvars<br/>(image_sha = el de arriba,<br/>SOLO importa la 1ª vez)"]
+        tfapply(("③ terraform apply<br/>(staging)"))
+        crv1["Cloud Run creado:<br/>revisión oms-staging-00001<br/>100% tráfico, imagen del apply"]
+        tfvars --> tfapply --> crv1
+    end
+
+    subgraph ansible_stg["③ ANSIBLE — despliegues SIGUIENTES a staging (⚠ y también el 1º vía Ansible si aplica)"]
+        readtf1(("④ terraform output -json<br/>(lee cpu/mem/instancias)"))
+        ansdeploy_stg(("⑤ ansible-playbook deploy.yml<br/>-e env=staging"))
+        crv2["Nueva revisión oms-staging-00010<br/>--no-traffic al crearla"]
+        trafstg(("⑥ update-traffic<br/>100% (staging = big-bang)"))
+        readtf1 --> ansdeploy_stg --> crv2 --> trafstg
+    end
+
+    subgraph promote["④ PROMOCIÓN — copiar el MISMO digest a producción"]
+        pull(("⑦ docker pull<br/>(por digest, desde staging)"))
+        pushprod(("⑧ docker tag + push<br/>→ Artifact Registry PRODUCCIÓN"))
+        samedigest["MISMO sha256:d68ca4fc...<br/>verificado idéntico"]
+        pull --> pushprod --> samedigest
+    end
+
+    subgraph first_prod["⑤ PRODUCCIÓN — primer despliegue (caso especial: SIN revisión previa)"]
+        tfapplyprod(("⑨ terraform apply<br/>(producción, 1ª vez)"))
+        crprod1["Cloud Run creado:<br/>revisión oms-production-00001<br/>100% tráfico (no hay canary posible:<br/>no existe nada a lo que dejarle el 90%)"]
+        tfapplyprod --> crprod1
+    end
+
+    subgraph ansible_prod["⑥ ANSIBLE — despliegues SIGUIENTES a producción (canary real)"]
+        readtf2(("④ terraform output -json"))
+        ansdeploy_prod(("⑩ ansible-playbook deploy.yml<br/>-e env=production<br/>(sin -e traffic_percent, usa el 10% default)"))
+        crprod2["Nueva revisión oms-production-00003<br/>tag rev-d68ca4fc, --no-traffic al crearla"]
+        canary(("⑪ update-traffic<br/>--to-tags rev-d68ca4fc=10"))
+        split["REPARTO REAL VERIFICADO:<br/>00002-dsl (vieja) → 90%<br/>00003-yod (nueva) → 10%"]
+        readtf2 --> ansdeploy_prod --> crprod2 --> canary --> split
+    end
+
+    subgraph promote_canary["⑦ PROMOCIÓN DEL CANARY — si el 10% se ve sano"]
+        promo(("⑫ update-traffic<br/>--to-tags rev-d68ca4fc=100"))
+        full100["00003-yod → 100%<br/>(verificado: /health → version 0.2.0)"]
+        promo --> full100
+    end
+
+    subgraph rollback_flow["⑧ ROLLBACK — vuelta a la revisión anterior"]
+        checktraffic{"¿Hay EXACTAMENTE<br/>1 revisión al 100%?"}
+        failcanary["❌ FALLA a propósito si el<br/>tráfico está repartido en canary<br/>(verificado: no hace nada silencioso)"]
+        okrollback(("⑬ ansible-playbook rollback.yml<br/>-e env=production"))
+        findprev["Busca N-1 en status.traffic[]<br/>(NO por fecha de creación)"]
+        applyrollback(("⑭ update-traffic<br/>--to-revisions 00002-dsl=100"))
+        restored["00002-dsl → 100%<br/>(verificado: /health SIN version,<br/>= la imagen anterior)"]
+        checktraffic -->|no, hay canary activo| failcanary
+        checktraffic -->|sí, 1 sola al 100%| okrollback --> findprev --> applyrollback --> restored
+    end
+
+    pushstg --> tfapply
+    crv1 -.->|servicio ya existe:<br/>siguientes cambios de imagen<br/>los hace Ansible, no Terraform| readtf1
+    trafstg -.->|imagen ya validada en staging| pull
+    samedigest --> tfapplyprod
+    crprod1 -.->|servicio ya existe:<br/>próximos despliegues, vía Ansible| readtf2
+    split -.->|decisión: promover o rollback| promote_canary
+    split -.->|decisión: promover o rollback| checktraffic
+    full100 -.->|si algo falla después| checktraffic
+
+    style dockerbuild fill:#e8f0fe,stroke:#1a73e8,stroke-width:3px
+    style pushstg fill:#e8f0fe,stroke:#1a73e8,stroke-width:3px
+    style tfapply fill:#e8f0fe,stroke:#1a73e8,stroke-width:3px
+    style tfapplyprod fill:#e8f0fe,stroke:#1a73e8,stroke-width:3px
+    style readtf1 fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style ansdeploy_stg fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style trafstg fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style pull fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style pushprod fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style readtf2 fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style ansdeploy_prod fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style canary fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style promo fill:#fef7e0,stroke:#f9ab00,stroke-width:3px
+    style okrollback fill:#fce8e6,stroke:#d93025,stroke-width:3px
+    style applyrollback fill:#fce8e6,stroke:#d93025,stroke-width:3px
+    style failcanary fill:#fce8e6,stroke:#d93025,stroke-width:2px,stroke-dasharray: 5 5
+```
+
+**Puntos clave que este diagrama deja explícitos (todos verificados contra GCP real, no solo diseñados):**
+
+1. **Terraform solo crea el servicio Cloud Run la PRIMERA vez.** A partir de ahí, `image`, `traffic`, `client` y `revision` están en `lifecycle.ignore_changes` — Terraform "suelta" esos campos y nunca vuelve a tocarlos, para no pisarse con Ansible en cada `apply` posterior.
+2. **`cpu`/`memory`/`min_instances`/`max_instances` SIEMPRE vienen de Terraform**, incluso en despliegues de Ansible — se leen en vivo con `terraform output -json` (círculos ④), nunca se duplican a mano en `group_vars`.
+3. **Staging es "big-bang"** (100% de tráfico inmediato a la nueva revisión) — **producción es canary real** (10% inicial, verificado con dos revisiones sirviendo tráfico simultáneamente y confirmado con `curl` contra la URL con tag vs la URL principal).
+4. **El primer despliegue a producción es un caso especial**: no existe una revisión previa a la que dejarle el 90% restante, así que ese único despliegue usa 100% (decisión documentada), y el canary del 10% solo tiene sentido a partir de la *segunda* promoción en adelante.
+5. **El rollback tiene una condición de guarda real**: si el tráfico está repartido en canary (ninguna revisión al 100%), el playbook **falla explícitamente** en vez de adivinar a cuál volver — verificado provocándolo a propósito.
+6. **El rollback busca la revisión anterior por tráfico real (`status.traffic[]`), no por fecha de creación** — un hallazgo real de esta fase: la revisión creada más recientemente no siempre es la que tiene tráfico.
+
+---
+
 ## 3 · Glosario de términos
 
 | Término | Qué significa |
@@ -202,6 +313,12 @@ flowchart TB
 | **Healthcheck / probe** | Verificación automática de que un servicio está "vivo" y respondiendo correctamente |
 | **`startup_probe`** | Verificación que se ejecuta solo al arrancar un contenedor nuevo, antes de enviarle tráfico real |
 | **`liveness_probe`** | Verificación continua durante toda la vida de una instancia; si falla repetidamente, se reinicia el contenedor |
+| **`terraform output`** | Comando que muestra los valores que un módulo de Terraform expone deliberadamente (ej. una URL, una IP, o —en este proyecto— la CPU/memoria configurada); otras herramientas (aquí, Ansible) pueden leerlos para no duplicar esa información a mano |
+| **`lifecycle.ignore_changes`** | Instrucción de Terraform para decirle "declara este campo al crear el recurso, pero nunca vuelvas a tocarlo en futuros `apply`" — útil cuando otra herramienta (aquí, Ansible) es quien gestiona ese campo después |
+| **Recurso `tainted`** | Estado interno de Terraform que marca un recurso como "quedó en un estado inconsistente tras un fallo a mitad de creación" — el siguiente `apply` lo destruye y recrea automáticamente, sin intervención manual |
+| **Promoción (de una imagen)** | Copiar una imagen Docker ya construida y probada de un registro a otro (ej. de staging a producción) sin reconstruirla — el digest SHA-256 resultante es idéntico, porque es un hash del contenido, no de la ubicación |
+| **Milicore (`m`, ej. `1000m`)** | Unidad para expresar fracciones de un CPU virtual: `1000m` = 1 CPU completo, `500m` = medio CPU. Cloud Run solo acepta valores entre `80m` y `1000m`, o enteros exactos (`1`, `2`, `4`, `6`, `8`) — no admite fracciones intermedias como `1.5` |
+| **Canary (promoción gradual)** | Enviar un porcentaje pequeño del tráfico real a una revisión nueva (ej. 10%) mientras el resto sigue en la versión anterior, para detectar problemas antes de exponer a todos los usuarios — verificado en este proyecto con dos revisiones de producción sirviendo tráfico real y distinto contenido simultáneamente |
 
 ---
 
@@ -210,3 +327,4 @@ flowchart TB
 | Fecha | Cambio |
 |---|---|
 | 2026-09-21 | Creación inicial — diagrama y glosario cubriendo los 38 recursos de las Fases 1, 2 y 3 (network, database, compute, iam) |
+| 2026-09-22 | Fase 4 y 5: agregado el diagrama de flujo "de dónde sale el build y quién despliega cada vez" (sección 2.bis) — cubre Docker build, Terraform en la corrida inicial, Ansible en corridas subsecuentes leyendo `terraform output`, staging vs producción, el caso especial del primer despliegue sin revisión previa, canary real del 10% verificado con tráfico dividido de verdad, y rollback (incluyendo su condición de guarda cuando el tráfico está repartido en canary). 6 términos nuevos en el glosario |

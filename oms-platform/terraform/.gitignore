@@ -1,0 +1,21 @@
+# ── Terraform ────────────────────────────────────────────────────
+# Nunca versionar: binarios de providers descargados, archivos de plan
+# (pueden contener valores sensibles del state en texto plano), y el
+# tfstate local (aunque usamos backend remoto GCS, por si alguien corre
+# un comando sin -backend-config y Terraform cae al backend local).
+
+.terraform/
+.terraform.lock.hcl.backup
+*.tfplan
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Variables que puedan contener secretos si alguna vez se generan a mano
+# fuera de envs/*.tfvars (que sí se versionan, no llevan secretos reales).
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

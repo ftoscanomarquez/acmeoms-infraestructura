@@ -22,18 +22,93 @@
           - env is defined
           - env in ['staging', 'production']
 
-    - name: "Listar revisiones recientes del servicio"
-      # TODO(alumno): usa el módulo google.cloud.gcp_run_service_info o un
-      # ansible.builtin.command con `gcloud run revisions list` para obtener
-      # las dos últimas revisiones.
+    - name: "Averiguar qué revisión recibe tráfico AHORA MISMO"
+      # HALLAZGO REAL: la primera versión de este playbook asumía que
+      # "la revisión más recientemente CREADA" == "la revisión activa", y
+      # tomaba el [0] de `gcloud run revisions list` (que ordena por fecha
+      # de creación) como la activa. Es un supuesto falso en cuanto existe
+      # una revisión desplegada con --no-traffic (como hace precisamente
+      # nuestro propio role oms_cloud_run: crea la revisión sin tráfico y
+      # la promueve en un paso aparte) o una revisión de prueba manual: esa
+      # revisión es "la más nueva" pero puede no tener ni un % de tráfico.
+      # Verificado en staging: con una revisión de prueba sin tráfico más
+      # reciente que la que realmente servía el 100%, el playbook anterior
+      # habría hecho rollback A LA REVISIÓN YA ACTIVA (no-op silencioso) en
+      # vez de fallar o avisar — un bug peligroso en una operación de
+      # emergencia. La fuente de verdad de "quién está activa" es
+      # `status.traffic[]` del servicio, no el orden de creación.
+      ansible.builtin.shell:
+        cmd: >-
+          gcloud run services describe {{ cloud_run_service }}
+          --region={{ region }}
+          --flatten="status.traffic[]"
+          --format="value(status.traffic.revisionName,status.traffic.percent)"
+          | awk -F'\t' '$2=="100"{print $1}'
+      register: active_revision_result
+      changed_when: false
+
+    - name: "Validar que hay exactamente una revisión con el 100% del tráfico"
+      ansible.builtin.assert:
+        that:
+          - active_revision_result.stdout_lines | length == 1
+        fail_msg: >-
+          No se pudo determinar una única revisión activa al 100% en
+          {{ cloud_run_service }} (tráfico repartido en canary, o servicio
+          sin tráfico asignado) — este rollback simple no cubre ese caso,
+          requiere decidir manualmente a qué revisión volver.
+
+    - name: "Fijar la revisión activa como variable"
+      ansible.builtin.set_fact:
+        active_revision: "{{ active_revision_result.stdout }}"
+
+    - name: "Listar todas las revisiones del servicio (más nueva primero)"
+      # No existe módulo google.cloud.gcp_run_service_info para Cloud Run en
+      # la colección instalada (misma laguna documentada en
+      # roles/oms_cloud_run/tasks/main.yml) — se usa `gcloud run revisions
+      # list`, que ordena por fecha de creación descendente por defecto.
+      ansible.builtin.command:
+        cmd: >-
+          gcloud run revisions list
+          --service={{ cloud_run_service }}
+          --region={{ region }}
+          --format=value(metadata.name)
+      register: all_revisions
+      changed_when: false
+
+    - name: "Identificar la posición de la revisión activa en el historial"
+      ansible.builtin.set_fact:
+        active_revision_index: "{{ all_revisions.stdout_lines.index(active_revision) }}"
+
+    - name: "Validar que existe una revisión anterior a la activa"
+      ansible.builtin.assert:
+        that:
+          - (active_revision_index | int) + 1 < (all_revisions.stdout_lines | length)
+        fail_msg: >-
+          La revisión activa ({{ active_revision }}) es la más antigua que
+          existe en {{ cloud_run_service }} — no hay una revisión N-1 a la
+          que hacer rollback.
+
+    - name: "Identificar la revisión N-1 respecto a la activa (no respecto a la más reciente creada)"
+      ansible.builtin.set_fact:
+        previous_revision: "{{ all_revisions.stdout_lines[(active_revision_index | int) + 1] }}"
+
+    - name: "Mostrar plan de rollback antes de aplicarlo"
       ansible.builtin.debug:
-        msg: "TODO: listar revisiones de {{ cloud_run_service }}"
+        msg: |
+          Revisión activa ahora (100% tráfico): {{ active_revision }}
+          Revisión a la que se hará rollback:    {{ previous_revision }}
 
     - name: "Asignar 100% del tráfico a la revisión anterior"
-      # TODO(alumno): `gcloud run services update-traffic` con --to-revisions
-      # apuntando a la versión anterior.
-      ansible.builtin.debug:
-        msg: "TODO: redirigir tráfico a la revisión N-1"
+      # --to-revisions (no --to-tags) porque aquí apuntamos a una revisión ya
+      # existente por su nombre, no a una recién etiquetada por este mismo run.
+      ansible.builtin.command:
+        cmd: >-
+          gcloud run services update-traffic {{ cloud_run_service }}
+          --region={{ region }}
+          --to-revisions={{ previous_revision }}=100
+          --quiet
+      register: rollback_result
+      changed_when: "'No changes' not in rollback_result.stderr"
 
     - name: "Anunciar rollback"
       ansible.builtin.debug:

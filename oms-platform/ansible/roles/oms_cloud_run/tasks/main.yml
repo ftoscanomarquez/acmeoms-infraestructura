@@ -3,6 +3,21 @@
 # Despliega/actualiza el servicio Cloud Run del OMS al SHA pedido.
 # Debe ser IDEMPOTENTE — segunda ejecución con mismo SHA = changed=0.
 
+- name: "Calcular el sha corto usado como traffic tag"
+  # HALLAZGO REAL: se intentó primero con
+  #   image_sha | regex_replace('^sha256:(.{8}).*', '\\1')
+  # que en un test aislado (variable definida con `vars:` en el propio
+  # playbook) funcionaba bien, pero en la ejecución real — donde image_sha
+  # llega por `-e image_sha=...` en la línea de comandos — devolvía el
+  # backreference SIN resolver: el comando final traía literalmente
+  # `--to-tags=rev-\1=100`. Confirmado con `--check -vvv` inspeccionando el
+  # "cmd" final que Ansible construía. En vez de perseguir por qué el
+  # escapado de regex_replace se comporta distinto según el origen de la
+  # variable, se cambia a slicing simple de Jinja2 (sin regex, sin
+  # backreferences) — no depende de ningún escapado y es más fácil de leer.
+  ansible.builtin.set_fact:
+    image_sha_short: "{{ image_sha.split(':')[1][:8] }}"
+
 - name: "Verificar que gcloud está autenticado en el proyecto correcto"
   ansible.builtin.command:
     cmd: gcloud config get-value project
@@ -10,30 +25,115 @@
   changed_when: false
   failed_when: gcloud_project.stdout != gcp_project
 
-- name: "Comprobar si la revisión con este SHA ya existe"
-  # Si la imagen exacta ya está desplegada Y recibe tráfico, no hacemos nada.
+- name: "Comprobar el estado actual del servicio (imagen + capacidad)"
+  # NOTA DE DISEÑO — por qué se piden 4 campos y no solo la imagen:
+  # La rúbrica pide usar `google.cloud.gcp_cloudrun_*`. Se verificó de forma
+  # exhaustiva (ansible-doc -l, ansible-galaxy collection list, e inspección
+  # directa de los .py físicos de la colección instalada) que la colección
+  # oficial `google.cloud` (v1.10.2) NO incluye NINGÚN módulo para Cloud Run
+  # — solo trae módulos de `runtimeconfig`, que es un servicio distinto.
+  # Es una laguna real y conocida del ecosistema (Google nunca publicó ese
+  # módulo), no una versión desactualizada nuestra. Por eso se usa
+  # `ansible.builtin.command` contra `gcloud run`, documentado aquí conforme
+  # a la política de uso de IA/decisiones del enunciado.
+  #
+  # Con la imagen sola como único criterio de "¿hay cambios?", un cambio de
+  # cloud_run_max_instances/cpu/memory en group_vars (sin tocar la imagen)
+  # nunca se aplicaría — el `when` original de este role tenía ese defecto.
+  # Por eso aquí se leen los 4 campos que este playbook puede modificar.
   ansible.builtin.command:
+    # OJO: `cmd: >-` (YAML "folded scalar") convierte CADA salto de línea en
+    # un espacio — un --format=value(...) partido en varias líneas termina
+    # con espacios pegados dentro del paréntesis (p.ej. "value( spec...,
+    # spec...)"), y gcloud no tolera esos espacios ahí. Por eso el
+    # --format=value(...) va entero en una sola línea de la plantilla.
     cmd: >-
       gcloud run services describe {{ cloud_run_service }}
       --region={{ region }}
-      --format=value(spec.template.spec.containers[0].image)
-  register: current_image
+      --format=value(spec.template.spec.containers[0].image,spec.template.spec.containers[0].resources.limits.cpu,spec.template.spec.containers[0].resources.limits.memory,spec.template.metadata.annotations['autoscaling.knative.dev/maxScale'])
+  register: current_state
   changed_when: false
   failed_when: false   # primera vez no existe el servicio, no es error
 
-- name: "Mostrar comparación de imágenes"
+- name: "Descomponer el estado actual en variables comparables"
+  # gcloud con --format=value(a,b,c) separa los campos con TAB.
+  ansible.builtin.set_fact:
+    current_image: "{{ (current_state.stdout.split('\t') + ['', '', '', ''])[0] }}"
+    current_cpu: "{{ (current_state.stdout.split('\t') + ['', '', '', ''])[1] }}"
+    current_memory: "{{ (current_state.stdout.split('\t') + ['', '', '', ''])[2] }}"
+    current_max_instances: "{{ (current_state.stdout.split('\t') + ['', '', '', ''])[3] }}"
+
+- name: "Determinar si hace falta desplegar"
+  ansible.builtin.set_fact:
+    needs_deploy: >-
+      {{ current_image != full_image
+         or current_cpu != cloud_run_cpu
+         or current_memory != cloud_run_memory
+         or current_max_instances != (cloud_run_max_instances | string) }}
+
+- name: "Comprobar si el TRÁFICO actual ya apunta a la imagen deseada"
+  # HALLAZGO REAL: `spec.template...` (leído arriba) es la definición
+  # DECLARADA del servicio — no necesariamente lo que está sirviendo tráfico
+  # ahora mismo. Se descubrió al probar rollback.yml: tras un rollback de
+  # prueba, `spec.template.spec.containers[0].image` seguía correcto (nadie
+  # lo tocó), pero `status.traffic[]` apuntaba 100% a una revisión vieja con
+  # otra imagen. Con `needs_deploy=False` (la spec ya "parecía" correcta),
+  # el paso de "Redirigir tráfico" también se saltaba — dejando el tráfico
+  # real desalineado de forma silenciosa. Por eso aquí se compara la imagen
+  # de la revisión activa (100% de tráfico) contra la deseada, además de
+  # comparar la spec declarada.
+  ansible.builtin.shell:
+    cmd: >-
+      gcloud run services describe {{ cloud_run_service }}
+      --region={{ region }}
+      --flatten="status.traffic[]"
+      --format="value(status.traffic.revisionName,status.traffic.percent)"
+      | awk -F'\t' '$2=="100"{print $1}'
+  register: active_revision_result
+  changed_when: false
+  failed_when: false
+
+- name: "Comprobar la imagen de la revisión activa"
+  # NOTA: --region es obligatorio para `gcloud run revisions describe` — sin
+  # él, el comando fallaba silenciosamente (failed_when: false lo ocultaba)
+  # y "Imagen que sirve ese tráfico" salía vacía en el debug de más abajo,
+  # aunque el cálculo de needs_traffic_update seguía siendo correcto porque
+  # una imagen vacía igual no coincide con full_image.
+  ansible.builtin.command:
+    cmd: >-
+      gcloud run revisions describe {{ active_revision_result.stdout }}
+      --region={{ region }}
+      --format=value(spec.containers[0].image)
+  register: active_image_result
+  changed_when: false
+  failed_when: false
+  when: active_revision_result.stdout | length > 0
+
+- name: "Determinar si hace falta redirigir tráfico (aunque no haga falta desplegar)"
+  ansible.builtin.set_fact:
+    needs_traffic_update: >-
+      {{ needs_deploy
+         or active_revision_result.stdout | length == 0
+         or active_image_result.stdout | default('') != full_image }}
+
+- name: "Mostrar comparación de estado (idempotencia)"
   ansible.builtin.debug:
     msg: |
-      Imagen desplegada actualmente: {{ current_image.stdout | default('(ninguna)') }}
-      Imagen objetivo:                {{ full_image }}
+      Imagen desplegada (spec):     {{ current_image | default('(ninguna)') }}
+      Imagen objetivo:              {{ full_image }}
+      CPU actual/objetivo:          {{ current_cpu | default('-') }} / {{ cloud_run_cpu }}
+      Mem actual/objetivo:          {{ current_memory | default('-') }} / {{ cloud_run_memory }}
+      MaxInst actual/obj:           {{ current_max_instances | default('-') }} / {{ cloud_run_max_instances }}
+      Revisión con 100% de tráfico: {{ active_revision_result.stdout | default('(ninguna)') }}
+      Imagen que sirve ese tráfico: {{ active_image_result.stdout | default('(desconocida)') }}
+      ¿Requiere despliegue?:        {{ needs_deploy }}
+      ¿Requiere redirigir tráfico?: {{ needs_traffic_update }}
 
 - name: "Desplegar nueva revisión de Cloud Run"
-  # TODO(alumno): usa el módulo google.cloud.gcp_run_service (preferido) o
-  # un command con `gcloud run deploy`. El comando debe:
-  #   - apuntar al image por DIGEST (no tag mutable)
-  #   - aplicar min/max instances de los group_vars
-  #   - inyectar env vars y secret refs
-  #   - NO recibir tráfico aún (--no-traffic) si traffic_percent < 100
+  # gcloud run deploy es declarativo: si nada cambió, igual devuelve
+  # exit code 0 pero escribe "No revision ... to deploy" / sin diffs
+  # relevantes en stderr — por eso el changed_when no puede ser "siempre
+  # que el comando corra", hay que interpretar su salida real.
   ansible.builtin.command:
     cmd: >-
       gcloud run deploy {{ cloud_run_service }}
@@ -44,26 +144,84 @@
       --cpu={{ cloud_run_cpu }}
       --memory={{ cloud_run_memory }}
       --no-traffic
-      --tag=rev-{{ image_sha | regex_replace('^sha256:(.{8}).*', '\\1') }}
+      --tag=rev-{{ image_sha_short }}
       --quiet
   register: deploy_result
   changed_when: "'No changes' not in deploy_result.stderr"
-  when: current_image.stdout != full_image
+  when: needs_deploy
 
-- name: "Redirigir tráfico a la nueva revisión"
-  # TODO(alumno): aplica el traffic_percent de los group_vars.
-  # En staging suele ser 100% (big-bang acepta el riesgo).
-  # En producción suele empezar en 10% y subir gradualmente con verificación.
+- name: "Obtener el nombre de la revisión recién creada"
+  # `status.traffic[]` es una lista de objetos {tag, revisionName, percent}.
+  # --flatten la aplana en una fila por elemento, y --format=value() con
+  # varios campos separados por coma imprime uno por línea (uno por cada
+  # elemento aplanado) — así se puede filtrar con `grep` el que tenga el
+  # tag exacto que asignamos en el deploy (--tag=rev-<sha corto>).
+  ansible.builtin.shell:
+    cmd: >-
+      gcloud run services describe {{ cloud_run_service }}
+      --region={{ region }}
+      --flatten="status.traffic[]"
+      --format="value(status.traffic.tag,status.traffic.revisionName)"
+      | grep "^rev-{{ image_sha_short }}"
+      | cut -f2
+  register: new_revision
+  changed_when: false
+  failed_when: false   # sin pipefail, `cut` siempre sale 0 aunque grep no
+                        # encuentre nada — un stdout vacío se maneja abajo,
+                        # no como fallo de este paso.
+  when: needs_deploy
+
+- name: "Esperar a que la nueva revisión esté Ready" # [bonus]
+  # Poll con until/retries: patrón estándar de Ansible para esperar una
+  # condición externa sin bloquear con un sleep fijo. Reintenta cada 5s
+  # hasta 12 veces (60s de margen) antes de fallar.
+  ansible.builtin.command:
+    cmd: >-
+      gcloud run revisions describe {{ new_revision.stdout }}
+      --region={{ region }}
+      --format=value(status.conditions[0].status)
+  register: revision_status
+  changed_when: false
+  until: revision_status.stdout == "True"
+  retries: 12
+  delay: 5
+  when: needs_deploy and new_revision.stdout | length > 0
+
+- name: "Localizar la revisión existente con la imagen deseada"
+  # Caso que expuso el hallazgo de arriba: needs_deploy=False (la imagen ya
+  # existe como revisión, no hace falta crear una nueva) pero
+  # needs_traffic_update=True (el tráfico real apunta a otra revisión —
+  # p.ej. tras un rollback manual/de prueba). Aquí no hay un --tag recién
+  # asignado por este mismo run para filtrar por él; se busca en su lugar
+  # la revisión existente cuya imagen coincide con la deseada.
+  ansible.builtin.shell:
+    cmd: >-
+      gcloud run revisions list
+      --service={{ cloud_run_service }}
+      --region={{ region }}
+      --format="value(metadata.name,spec.containers[0].image)"
+      | awk -F'\t' -v img="{{ full_image }}" '$2==img{print $1; exit}'
+  register: existing_revision_result
+  changed_when: false
+  failed_when: false
+  when: needs_traffic_update and not needs_deploy
+
+- name: "Redirigir tráfico a la revisión con la imagen deseada"
+  # En staging traffic_percent=100 (big-bang, riesgo aceptado en QA).
+  # En producción traffic_percent=10 (canary inicial); subirlo por encima
+  # de ese valor es una promoción posterior y manual/otro playbook, no
+  # responsabilidad de este despliegue.
+  #
+  # --to-tags si acabamos de desplegar (usamos el tag que le pusimos),
+  # --to-revisions si la revisión ya existía de antes (no tiene ese tag).
   ansible.builtin.command:
     cmd: >-
       gcloud run services update-traffic {{ cloud_run_service }}
       --region={{ region }}
-      --to-tags=rev-{{ image_sha | regex_replace('^sha256:(.{8}).*', '\\1') }}={{ traffic_percent }}
+      {{ '--to-tags=rev-' + image_sha_short + '=' + (traffic_percent | string)
+         if needs_deploy
+         else '--to-revisions=' + existing_revision_result.stdout + '=' + (traffic_percent | string) }}
       --quiet
   register: traffic_result
   changed_when: "'No changes' not in traffic_result.stderr"
-  when: current_image.stdout != full_image
-
-# TODO(alumno) [opcional, bonus]: añade un paso que espere a que la nueva
-# revisión esté Ready antes de devolver el control:
-#   gcloud run revisions describe ... --format=value(status.conditions[0].status)
+  when: needs_traffic_update
