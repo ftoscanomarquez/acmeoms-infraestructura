@@ -2538,3 +2538,96 @@ El remoto `github` contiene el repo completo del máster (igual que `origin`/Git
 **Nota de diseño discutida con el usuario:** se consideró dividir el pipeline en varios archivos (patrón de *reusable workflows* con `workflow_call`, similar a los templates de Azure Pipelines que el usuario conocía de una experiencia previa). Se explicó que GitHub Actions sí soporta ese patrón, pero con una restricción real: el archivo "llamado" también debe vivir en `.github/workflows/` de la raíz (nunca en `oms-platform/ansible/` ni en ninguna otra carpeta) — no existe un mecanismo para que un workflow incluya lógica de un `.yml` en una ubicación arbitraria. Se decidió mantener un solo archivo, coincidiendo exactamente con el árbol de entregables del enunciado (`.github/workflows/ci-cd.yml`, un solo archivo). La separación de configuración por ambiente (lo que en Azure serían "variable groups") se resuelve con **GitHub Environments** (`staging`/`production`), cada uno con sus propias Variables — sin necesitar un YAML aparte.
 
 **Estado de la Fase 6 al momento de escribir esto: workflow completo escrito, en la ubicación correcta (`.github/workflows/ci-cd.yml` en la raíz), validado sintácticamente, 3 bugs reales corregidos (output inexistente, `ARG` faltante, ubicación equivocada del archivo) y verificados. Pendiente: los pasos manuales de la sección 6.5 (crear variables en GitHub, configurar el environment, y disparar el pipeline con un push real).
+
+### 6.7 · Ejecución real del primer push y explicación línea por línea
+
+Con las 6 Repository Variables y el `environment: production` (con Required reviewers) ya configurados manualmente en GitHub por el usuario, se hizo el primer `git push` real a ambos remotos:
+
+```bash
+git add -A
+git commit -m "feat(ansible,terraform,ci-cd): completar Fases 4, 5 y 6"
+git push origin main    # GitLab, entrega/evaluación
+git push github main    # GitHub, dispara el job "ci" por primera vez
+```
+
+Antes del commit se verificaron localmente los 3 chequeos que exige el job `ci`, para no descubrir un fallo trivial solo cuando corriera en GitHub Actions:
+
+```bash
+terraform fmt -check -recursive -diff   # → encontró 6 archivos mal formateados (espaciado de comentarios inline)
+terraform fmt -recursive                # → corregido, solo cambios de estilo, "No changes" confirmado con plan real
+docker run --rm -i hadolint/hadolint hadolint --failure-threshold error - < Dockerfile
+  # → DL3025 (warning): HEALTHCHECK en shell-form en vez de exec-form — corregido
+  # → DL3066 (info): USER por nombre en vez de UID numérico — dejado, no bloquea el failure-threshold
+docker run --rm -v $(pwd):/repo zricethezav/gitleaks:latest detect --source=/repo --no-git
+  # → "no leaks found"
+```
+
+Verificado además con un contenedor real que el `HEALTHCHECK` en formato exec (`CMD ["wget", "-qO-", "..."]`) sigue funcionando correctamente: `docker inspect --format='{{.State.Health.Status}}'` → `healthy`.
+
+**Resultado real del primer push** (`gh run list` / `gh run view`):
+
+```
+✓ CI — lint, validate, build de prueba (20-alpine) in 29s
+✓ CI — lint, validate, build de prueba (22-alpine) in 29s
+- Build, push a staging y firma (Cosign keyless)      ← skipped (correcto: no es un tag)
+- Deploy → staging (Ansible)                           ← skipped
+- Promote → producción (Ansible, canary 10%)           ← skipped
+```
+
+Confirma exactamente el diseño: un push normal a `main` solo ejecuta `ci` (ambas entradas de la matriz de Node, ahora sí probando algo distinto de verdad gracias al fix del `ARG NODE_BASE`), y los 3 jobs de despliegue real quedan `skipped` por su condición `if: startsWith(github.ref, 'refs/tags/v')` — el pipeline no toca GCP en absoluto con un push normal.
+
+Se explicó al usuario, a su pedido, el workflow completo línea por línea (conceptos de CI/CD, `strategy.matrix`, `needs`, `outputs` de job, contexto `github.*`, diferencia entre `uses:`/`run:`, por qué cada job corre en una máquina nueva y aislada, el mecanismo completo de WIF paso a paso, y el ciclo firmar/verificar de Cosign) — repaso pedagógico para que pueda defenderlo en el video de explicación del trabajo, documentado aquí como referencia si hace falta repasarlo después.
+
+### 6.8 · SonarCloud — capacidad cableada pero deshabilitada a propósito
+
+A petición del usuario (pregunta sobre dónde encajaría un análisis estático tipo SonarQube en el pipeline), se agregó un paso real y funcional en el job `ci`, justo después de `gitleaks`, pero deshabilitado explícitamente en vez de omitido del código:
+
+```yaml
+- name: "SonarCloud — análisis estático (requiere SONAR_TOKEN + SONAR_HOST_URL)"
+  if: ${{ vars.SONAR_HOST_URL != '' }}
+  uses: SonarSource/sonarqube-scan-action@v4
+  env:
+    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+```
+
+**Motivo de no activarlo de verdad:** `server.js` es un placeholder mínimo de infraestructura (no código de negocio real, ver su propia cabecera) — no hay código sustancial que un análisis estático de calidad pueda evaluar con sentido todavía; eso llega con el bloque del máster que implemente el OMS real. Se explicó al usuario la diferencia entre SonarCloud (SaaS, gratis para repos públicos —como el nuestro, tras el cambio de visibilidad de la sección 6.6— de pago para privados) y SonarQube Community Edition self-hosted (gratis siempre, pero requeriría exponer el servidor en una red alcanzable por los runners de GitHub Actions — complejidad de red real, potencial extensión futura del bonus "Bastion VM" de la Fase 7).
+
+**Diseño del "apagado":** en vez de comentar el paso o quitarlo del YAML, se usa `if: ${{ vars.SONAR_HOST_URL != '' }}` — como esa Repository Variable no existe todavía, la condición evalúa a `false` y GitHub Actions marca el paso como `skipped` en el log, visible y explícito, en vez de que el paso simplemente no exista o falle por falta de credenciales. Para activarlo de verdad en el futuro: crear cuenta en SonarCloud, añadir el Secret `SONAR_TOKEN` (a diferencia de las 6 Repository Variables de WIF, un token de SonarCloud sí concede acceso por sí solo — va como Secret, no Variable) y la Variable `SONAR_HOST_URL`.
+
+### 6.9 · Trivy — análisis de seguridad real (IaC + imagen), activado de verdad
+
+A diferencia de SonarCloud, el usuario preguntó específicamente por una alternativa gratuita, sin cuenta externa, para escanear vulnerabilidades de dependencias/imágenes — **Trivy** (Aqua Security) encaja exactamente: un solo binario, corre completo dentro del runner, gratis sin límites, con dos modos útiles aquí: `config` (misconfiguraciones de Terraform) e `image` (CVEs de la imagen Docker real).
+
+**Escáner 1 — `trivy config` contra `terraform/`, añadido al job `ci`.** Probado localmente contra el código real antes de decidir el umbral:
+
+```bash
+docker run --rm -v $(pwd):/src aquasec/trivy:latest config /src --format table
+```
+
+**Resultado inicial: 11 hallazgos (0 CRITICAL, 1 HIGH, 6 MEDIUM, 4 LOW).** Se revisó cada uno con criterio, no se aplicaron a ciegas:
+
+- **`GCP-0015` (HIGH) — "Database instance does not require TLS for all connections".** Hallazgo real y corregido: `ip_configuration` de Cloud SQL no declaraba `ssl_mode`. Se agregó `ssl_mode = "ENCRYPTED_ONLY"`. El usuario preguntó explícitamente si esto interfería con el certificado SSL del Load Balancer pendiente de dominio real — se aclaró que son dos capas de TLS completamente distintas: el certificado del LB protege *Internet → LB* (depende de DNS/dominio real), mientras que `ssl_mode` de Cloud SQL protege *Cloud Run → Cloud SQL* dentro de la red privada (gestionado internamente por Google, sin depender de ningún dominio externo). Verificado con `terraform plan`: `update in-place`, sin destruir la instancia. Aplicado contra staging y producción reales, verificado healthcheck sano en ambos tras el cambio.
+- **`GCP-0011` (MEDIUM) — "Project-level service account access grants the member broad impersonation rights".** Hallazgo real: `roles/iam.serviceAccountUser` se otorgaba al SA de CI/CD con `google_project_iam_member` (a nivel de PROYECTO completo), dándole en teoría capacidad de impersonar cualquier Service Account del proyecto, no solo el de runtime de Cloud Run que necesita. Corregido: movido a `google_service_account_iam_member`, acotado al recurso específico del SA de runtime (mismo patrón de mínimo privilegio ya usado para el binding de WIF). Verificado con `terraform plan`: 1 recurso destruido (el binding amplio) + 1 creado (el acotado) en ambos entornos — aplicado y verificado healthcheck sano tras el cambio.
+- **4× flags de logging de Cloud SQL faltantes (`log_temp_files`, `log_lock_waits`, `log_disconnections`, `log_checkpoints`, todos MEDIUM)**: agregados con valor `on`/`0`, complementando los 3 flags que ya existían desde la Fase 1 (`log_min_duration_statement`, `log_statement=ddl`, `log_connections`).
+- **`GCP-0021` (LOW) — "log_statement no debería estar activo"**: decisión consciente de NO aplicarlo — el aviso genérico de Trivy no distingue que `log_statement=ddl` (ya configurado) solo registra cambios de esquema, nunca datos de negocio, por lo que no expone información sensible pese a activar el flag.
+- **`GCP-0029`/`GCP-0076` (VPC Flow Logs deshabilitados, 2 LOW + 2 MEDIUM)**: decisión consciente de NO activarlos por ahora — es observabilidad de red adicional (no un riesgo de seguridad grave, la VPC ya tiene NAT + firewalls restrictivos por diseño desde la Fase 1) con un costo real de almacenamiento en Cloud Logging que crece con el tráfico. Documentado aquí como aceptado, no como pendiente oculto.
+
+**Resultado final tras las correcciones: 0 CRITICAL, 0 HIGH, 2 MEDIUM + 3 LOW (todos documentados como aceptados arriba).** El paso en el pipeline se fija con `severity: CRITICAL,HIGH` y `exit-code: 1` — bloquea el job `ci` solo si aparece algo de esa severidad, dejando visibles pero no bloqueantes los hallazgos menores ya revisados.
+
+**Escáner 2 — `trivy image` contra la imagen Docker real, añadido al job `build`, justo antes de la firma con Cosign** (la firma certifica una imagen ya escaneada, no al revés). Probado localmente:
+
+```bash
+docker build -t oms-trivy-test oms-platform/docker
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image oms-trivy-test --severity CRITICAL,HIGH
+```
+
+**Resultado: 8 CVEs (7 HIGH + 1 CRITICAL — `CVE-2026-59873` en `tar`).** Investigado con `--format json` antes de decidir qué hacer: **los 8 pertenecen exclusivamente al target `Node.js` (`Class: lang-pkgs`)** — es decir, a las dependencias internas del propio binario `npm` que trae la imagen base oficial `node:22-alpine` (confirmado que es la versión más reciente publicada, no una versión desactualizada nuestra). Ninguno pertenece al sistema operativo Alpine base ni a `package.json` (que no declara ninguna `dependency` real — placeholder de infraestructura).
+
+El usuario preguntó explícitamente si Trivy permite marcar excepciones documentadas en vez de bajar el umbral de severidad para todo el escaneo — confirmado que sí, vía **`.trivyignore`**. Se creó `oms-platform/docker/.trivyignore` con los 8 CVE IDs, cada uno con su propio comentario explicando por qué se excluye (paquete afectado, por qué no aplica a nuestro runtime). Nota curiosa documentada ahí: uno de los paquetes afectados se llama `sigstore` (`CVE-2026-48815`) — es una dependencia JS interna de `npm` para su propia función de firma de paquetes, **no relacionada** con el binario `cosign` (Go) que usa este mismo pipeline para firmar la imagen; confirmado con el `PkgPath` exacto (`.../npm/node_modules/sigstore/...`) antes de escribir la nota, para no dar una explicación incorrecta.
+
+**Hallazgo operativo real al probar el `.trivyignore` localmente**: montar el archivo con `-v $(pwd)/.trivyignore:/.trivyignore` (bind-mount de un archivo individual) falló con `ignore file not found`, aunque el archivo existía y era legible directamente desde WSL. Se resolvió montando el directorio completo con la ruta absoluta explícita (`-v /mnt/d/.../docker:/workspace`) en vez de un archivo suelto con `$(pwd)` — comportamiento atribuible a la capa de virtualización Docker Desktop↔WSL↔Windows, no reproducido dentro de GitHub Actions (que monta el checkout completo de forma nativa en Linux, sin esa capa intermedia). Verificado tras el fix: `exit-code: 0`, tabla de resultados muestra `0` (Clean) en todas las entradas de `node-pkg`.
+
+**Resultado final**: el paso en el pipeline usa `severity: CRITICAL,HIGH`, `exit-code: 1` y `trivyignores: oms-platform/docker/.trivyignore` — bloquea de verdad cualquier CVE CRITICAL/HIGH que no esté explícitamente excluido y documentado, incluyendo cualquier CVE futuro en una dependencia real que el proyecto llegue a declarar.
+
+**Estado final de la Fase 6 (documentación de este apartado): dos escáneres Trivy reales y activos (no simulados) en el pipeline, con 3 hallazgos reales de seguridad corregidos de verdad contra GCP (SSL de Cloud SQL, permisos IAM excesivos, logging faltante) y 8 CVEs de la imagen base documentados y excluidos con justificación individual — ningún hallazgo real se ignoró sin registro.

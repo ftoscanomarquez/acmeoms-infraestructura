@@ -76,12 +76,6 @@ resource "google_service_account_iam_binding" "cicd_wif" {
 #                                       la lectura de servicios/revisiones
 #                                       que usa Ansible para comparar
 #                                       imágenes y hacer el traffic-split).
-#   - roles/iam.serviceAccountUser   → necesario para poder "actuar en
-#                                       nombre de" el SA de runtime del
-#                                       módulo compute al desplegar
-#                                       (Cloud Run exige este permiso
-#                                       explícito, no basta con crear el
-#                                       recurso).
 #   - roles/artifactregistry.writer  → `docker push` de la imagen construida.
 #   - roles/artifactregistry.reader  → agregado explícitamente en vez de
 #                                       asumir que "writer" ya cubre
@@ -95,10 +89,20 @@ resource "google_service_account_iam_binding" "cicd_wif" {
 # NUNCA roles/owner ni roles/editor — ninguno de los 3 pasos del pipeline
 # necesita crear/modificar infraestructura (eso lo hace Terraform, con la
 # autenticación humana del desarrollador, no el SA de CI/CD).
+#
+# HALLAZGO REAL (Fase 6, Trivy config — GCP-0011, MEDIUM): roles/iam.
+# serviceAccountUser vivía en esta misma lista, otorgado con
+# google_project_iam_member — es decir, a nivel de PROYECTO completo. Eso
+# le daba al SA de CI/CD la capacidad de "actuar como" CUALQUIER Service
+# Account del proyecto (incluidos, en teoría, otros SAs que se creen en el
+# futuro), no solo el de runtime de Cloud Run que realmente necesita.
+# Corregido: se movió a un binding sobre el RECURSO específico del SA de
+# runtime (google_service_account_iam_member más abajo) — mismo patrón ya
+# usado para el binding de WIF (google_service_account_iam_binding) y para
+# los roles del propio SA de runtime, acotados a lo mínimo necesario.
 locals {
   cicd_roles = [
     "roles/run.developer",
-    "roles/iam.serviceAccountUser",
     "roles/artifactregistry.writer",
     "roles/artifactregistry.reader",
   ]
@@ -109,6 +113,17 @@ resource "google_project_iam_member" "cicd" {
   project  = var.project_id
   role     = each.value
   member   = "serviceAccount:${google_service_account.cicd.email}"
+}
+
+# roles/iam.serviceAccountUser ACOTADO al SA de runtime concreto (no a nivel
+# de proyecto) — necesario para que el SA de CI/CD pueda "actuar en nombre
+# de" el SA de runtime al desplegar en Cloud Run (Cloud Run exige este
+# permiso explícito, no basta con crear el recurso), pero sin extenderlo a
+# ningún otro Service Account del proyecto.
+resource "google_service_account_iam_member" "cicd_act_as_runtime" {
+  service_account_id = "projects/${var.project_id}/serviceAccounts/${var.cloud_run_sa}"
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.cicd.email}"
 }
 
 # ─── Permisos del SA del Cloud Run runtime ───────────────────────

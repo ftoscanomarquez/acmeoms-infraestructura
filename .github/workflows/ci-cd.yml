@@ -13,7 +13,10 @@
 # Estructura ("matriz + build + WIF + promote", según el árbol del
 # enunciado):
 #   job "ci"       → en TODO push/PR a main: lint + terraform validate +
-#                     build de prueba en matriz (no publica nada).
+#                     build de prueba en matriz (no publica nada). Incluye
+#                     un paso de SonarCloud cableado pero apagado (ver su
+#                     propio comentario más abajo) — sin código de negocio
+#                     real que analizar todavía, se deja listo para activar.
 #   job "build"     → SOLO cuando el push es un tag v* (ver más abajo):
 #                     build real + push a Artifact Registry de STAGING +
 #                     firma keyless con Cosign sobre el digest real.
@@ -104,6 +107,24 @@ jobs:
           terraform validate
         working-directory: oms-platform/terraform
 
+      - name: "Trivy — análisis de misconfiguraciones IaC (Terraform)"
+        # Escanea terraform/ en CADA push/PR, antes de aplicar nada — detecta
+        # malas prácticas de IaC (permisos excesivos, cifrado faltante, etc.)
+        # con la misma filosofía que gitleaks: encontrarlo en CI, no después
+        # de un apply real. Se revisó manualmente el resultado completo (ver
+        # BITACORA-COMANDOS.md § 6.9) antes de fijar severity: se corrigió el
+        # único hallazgo HIGH real (Cloud SQL sin ssl_mode=ENCRYPTED_ONLY) y
+        # un MEDIUM de permisos IAM excesivos (roles/iam.serviceAccountUser a
+        # nivel de proyecto, acotado al recurso específico) — los MEDIUM/LOW
+        # restantes (VPC Flow Logs deshabilitados, log_statement=ddl) son
+        # decisiones conscientes documentadas, no bloquean el pipeline.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: oms-platform/terraform
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
       - name: "gitleaks — cero credenciales estáticas en el repo"
         # Penalización explícita del enunciado: -20 pts si se encuentra
         # una credencial estática. Se corre en CI para detectarlo antes
@@ -111,6 +132,30 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── SonarCloud — análisis estático de código (deshabilitado a propósito) ──
+      # NOTA DE DISEÑO: paso real y funcional, dejado explícitamente "apagado"
+      # en vez de omitido del todo, para que quede visible en el pipeline como
+      # una capacidad ya cableada, documentando por qué no está activa ahora:
+      #   1. server.js es un placeholder mínimo de infraestructura (ver su
+      #      propia cabecera) — no hay código de negocio real que analizar
+      #      todavía; eso llega con el bloque que implemente el OMS real.
+      #   2. Requiere una cuenta de SonarCloud + SONAR_TOKEN (Secret, no
+      #      Variable — a diferencia de los identificadores de WIF, un token
+      #      de SonarCloud SÍ concede acceso por sí solo) y un
+      #      sonar-project.properties, que no se crearon por lo anterior.
+      # Si `vars.SONAR_HOST_URL` no está configurada (caso actual: no existe
+      # como Repository Variable), el `if:` evalúa a cadena vacía → false →
+      # el paso aparece en el log de Actions como "skipped", no se omite del
+      # YAML ni falla el job. Para activarlo de verdad: crear la cuenta
+      # (gratis para repos públicos, como este), añadir el Secret
+      # SONAR_TOKEN y la Variable SONAR_HOST_URL, y quitar este comentario.
+      - name: "SonarCloud — análisis estático (requiere SONAR_TOKEN + SONAR_HOST_URL)"
+        if: ${{ vars.SONAR_HOST_URL != '' }}
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
 
   # ── BUILD + PUSH + FIRMA — solo cuando el push es un tag v* ───────
   build:
@@ -161,6 +206,34 @@ jobs:
           build-args: |
             GIT_SHA=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+      # Referencia completa por digest, compuesta a mano por la misma razón
+      # documentada en `outputs.full_image_staging` de este job: la acción
+      # docker/build-push-action@v6 no expone un output "full_image".
+      - name: "Componer la referencia completa de la imagen recién subida"
+        id: full_ref
+        run: echo "value=${{ env.REGION }}-docker.pkg.dev/${{ vars.STAGING_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - name: "Trivy — escaneo de CVEs en la imagen real"
+        # Escanea la imagen YA construida y subida, justo antes de firmarla
+        # con Cosign — así la firma certifica una imagen ya escaneada, no al
+        # revés. HALLAZGO REAL (ver docker/.trivyignore y BITACORA-COMANDOS.md
+        # § 6.9): la imagen base oficial node:22-alpine (la más reciente
+        # publicada) trae 8 CVEs conocidos (7 HIGH + 1 CRITICAL) en el npm
+        # interno del propio binario node — ninguno en el SO Alpine base ni
+        # en nuestro código (nuestro package.json no declara dependencias).
+        # Se excluyen uno por uno, documentados, en docker/.trivyignore —
+        # nunca bajando el umbral de severidad para todo el escaneo — para
+        # que este paso SÍ bloquee cualquier CVE nuevo real que aparezca en
+        # el futuro (de nuestro código, de una dependencia que lleguemos a
+        # declarar, o de un cambio en la imagen base).
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.full_ref.outputs.value }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          trivyignores: oms-platform/docker/.trivyignore
 
       - name: "Instalar Cosign"
         uses: sigstore/cosign-installer@v3

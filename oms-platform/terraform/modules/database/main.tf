@@ -87,6 +87,14 @@ resource "google_sql_database_instance" "main" {
     ip_configuration {
       ipv4_enabled    = false # NUNCA expuesto a internet
       private_network = var.network_id
+      # HALLAZGO REAL (Fase 6, detectado con Trivy config — GCP-0015, HIGH):
+      # sin este campo, Cloud SQL admite conexiones SIN cifrar además de las
+      # cifradas. ENCRYPTED_ONLY exige TLS en TODAS las conexiones, incluso
+      # dentro de la red privada — coherente con REG-GDPR-001 (protección
+      # de datos) y con "cero credenciales en texto plano" que ya rige el
+      # proyecto. La conexión vía socket de Cloud Run (Cloud SQL Proxy
+      # integrado) ya cifra por diseño, así que esto no rompe nada existente.
+      ssl_mode = "ENCRYPTED_ONLY"
     }
 
     # NOTA DE DISEÑO (agregado por el equipo): "database_flags" son el
@@ -114,6 +122,45 @@ resource "google_sql_database_instance" "main" {
       # Registra cada nueva conexión a la base de datos — apoya la
       # trazabilidad de accesos que exige REG-GDPR-003 (audit trail).
       value = "on"
+    }
+
+    # HALLAZGO REAL (Fase 6, detectado con Trivy config — GCP-0014/0020/0022/
+    # 0025, todas MEDIUM): 4 flags de logging recomendados que faltaban.
+    # Nota sobre GCP-0021 (LOW, "log_statement no debería estar activo"):
+    # NO se cambia `log_statement=ddl` de arriba a "none" — ese aviso genérico
+    # de Trivy no distingue el matiz ya documentado: "ddl" registra SOLO
+    # cambios de esquema (CREATE/ALTER/DROP), nunca datos de negocio ni
+    # valores de columnas, así que no expone información sensible pese a
+    # activar el flag. Se prefiere mantenerlo por el valor de auditoría que
+    # ya justifica el comentario original.
+    database_flags {
+      name = "log_disconnections"
+      # Complementa log_connections: permite calcular duración de sesión y
+      # detectar patrones anómalos de desconexión (posible vector de DoS).
+      value = "on"
+    }
+    database_flags {
+      name = "log_lock_waits"
+      # Registra cuando una consulta espera por un lock — indicador temprano
+      # de contención/deadlocks y de un posible vector de denegación de
+      # servicio antes de que degrade el NFR-PERF-002.
+      value = "on"
+    }
+    database_flags {
+      name = "log_checkpoints"
+      # Los checkpoints de PostgreSQL son operaciones de I/O pesadas — su
+      # frecuencia/duración es un diagnóstico temprano de problemas de
+      # rendimiento del propio motor, no solo de las consultas de la app.
+      value = "on"
+    }
+    database_flags {
+      name = "log_temp_files"
+      # Registra archivos temporales en disco por encima de este umbral en
+      # bytes (0 = registrar todos). Consultas que generan archivos
+      # temporales suelen indicar un plan de ejecución ineficiente (falta de
+      # índice, sort en memoria insuficiente) — señal útil antes de que se
+      # traduzca en latencia visible para el usuario.
+      value = "0"
     }
 
     # TODO(alumno) [BONUS CMEK]: añade encryption_key_name apuntando a una CMEK propia

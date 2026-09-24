@@ -1,0 +1,56 @@
+# ── .trivyignore — CVEs excluidos deliberadamente del escaneo de imagen ──
+#
+# HALLAZGO REAL (Fase 6, ver BITACORA-COMANDOS.md § 6.9): al escanear la
+# imagen real con `trivy image`, aparecen 8 CVEs (7 HIGH + 1 CRITICAL,
+# CVE-2026-59873 en `tar`) — pero TODOS pertenecen exclusivamente al target
+# "Node.js" (Class: lang-pkgs), es decir, a las dependencias internas del
+# propio binario `npm` que trae la imagen base oficial `node:22-alpine`
+# (la versión más reciente publicada en el momento de escribir esto, no
+# una versión desactualizada nuestra). Ninguno pertenece al sistema
+# operativo Alpine base, y ninguno pertenece a nuestro `package.json`
+# (que no declara ninguna `dependency` — es un placeholder de
+# infraestructura, ver docker/server.js).
+#
+# Se excluyen aquí, UNO POR UNO Y DOCUMENTADO (nunca bajando el umbral de
+# severidad para todo el escaneo), para que el pipeline pueda seguir
+# BLOQUEANDO de verdad cualquier CVE nuevo que sí venga de nuestro propio
+# código o de una dependencia real que lleguemos a declarar en el futuro.
+# Revisar esta lista cuando se actualice la imagen base (node:22-alpine) —
+# es posible que Docker Hub publique una versión más reciente con el npm
+# interno ya parcheado, momento en el cual estas líneas dejarían de
+# aplicar y deberían eliminarse.
+
+# tar — CVE-2026-59873 (CRITICAL): DoS vía "gzip bomb". npm interno de la
+# imagen base usa tar solo para operaciones propias de instalación de
+# paquetes (que nuestro placeholder ni siquiera ejecuta en runtime).
+CVE-2026-59873
+
+# brace-expansion — 3 CVEs (HIGH): DoS por complejidad exponencial / memoria.
+# Dependencia interna de npm (glob matching de patrones de instalación),
+# nunca invocada por nuestro código en tiempo de ejecución.
+CVE-2026-13149
+CVE-2026-14257
+CVE-2026-69152
+
+# ip-address — CVE-2026-69192 (HIGH): SSRF por parseo inconsistente de IPs.
+# Dependencia interna de npm, no usada por server.js (que no hace ningún
+# parseo de direcciones IP de terceros).
+CVE-2026-69192
+
+# pacote — CVE-2026-9496 (HIGH): DoS vía spec.rawSpec manipulado.
+# Parte interna de npm para resolver paquetes remotos — nuestro placeholder
+# no instala nada en runtime, solo en build-time (etapa `deps` del
+# Dockerfile, que no se ejecuta en el contenedor final).
+CVE-2026-9496
+
+# picomatch — CVE-2026-33671 (HIGH): ReDoS vía patrones extglob.
+# Dependencia interna de npm para matching de globs.
+CVE-2026-33671
+
+# sigstore — CVE-2026-48815 (HIGH): verificación de certificateOIDs ignorada.
+# NOTA IRÓNICA pero real: esta es una dependencia del PROPIO npm interno de
+# la imagen (parte de su tooling de supply-chain), no la librería `cosign`
+# que usa este pipeline para firmar — son paquetes JavaScript distintos con
+# el mismo nombre de proyecto. No afecta a `cosign sign`/`cosign verify`,
+# que corren como binario Go instalado aparte vía sigstore/cosign-installer.
+CVE-2026-48815
