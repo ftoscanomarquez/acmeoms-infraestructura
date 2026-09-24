@@ -8,7 +8,7 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 6 (CI/CD) — ✅ **COMPLETA Y CERRADA**. Ambos workflows (`ci-cd.yml` y `canary-decision.yml`) verificados de punta a punta como ejecuciones reales de GitHub Actions contra GCP real, no solo como playbooks locales.
+**Fase en curso:** Fase 6 (CI/CD) ✅ **COMPLETA** y Fase 8 (documentación final) ✅ **CASI COMPLETA** — los 6 documentos principales (`README.md`, `INFRA.md`, `DEPLOYMENT.md`, `OBSERVABILIDAD.md`, `CERTIFICADOS.md`, `RETROSPECTIVA.md`) ya están escritos, basados en lectura directa del código real. Falta re-ejecutar los 7 comandos de verificación del enunciado en una sola pasada limpia, y decidir sobre Fase 7 (bonus).
 
 **Último hito completado:** El pipeline `ci-cd.yml` corrió de punta a punta (`ci` → `build` con Trivy+Cosign → `deploy-staging` → aprobación manual → `deploy-production`) tras 9 iteraciones de fixes reales, todos documentados en `BITACORA-COMANDOS.md` secciones 6.11–6.19. Verificado con `curl` real al healthcheck y `cosign verify` independiente de la firma en ambos registros (staging y producción).
 
@@ -33,7 +33,22 @@ Tras ambos fixes, run exitoso final `36013855248`: canary promovido de 10% a 50%
 
 Se dio además una explicación pedagógica completa, línea por línea, de todo `.github/workflows/ci-cd.yml` (para que el usuario lo pueda defender en su video), cubriendo: qué es CI/CD, `strategy.matrix`, `needs`, `outputs` de job, el contexto `github.*`, el mecanismo completo de WIF, el ciclo firmar/verificar de Cosign, y por qué la seguridad real vive en el `attribute_condition` de GCP, no en el YAML. También se explicó en detalle el mecanismo del canary (por qué vive en Cloud Run como una revisión más, cómo se reparte el tráfico por porcentaje, y por qué la subida de 10% a 100% es una decisión humana y no un temporizador ni una condición automática de métricas) — incluida la pregunta puntual de por qué una revisión en 0% de tráfico sigue existiendo sana en Cloud Run (no se invalida automáticamente: permite rollback instantáneo sin rebuild, y sos vos quien decide cuándo borrarla).
 
-**Siguiente paso concreto:** Fase 6 cerrada del todo. Continuar con Fase 7 (bonus) y Fase 8 (documentación final) según el tiempo disponible, y `terraform destroy` de ambos entornos al cierre.
+**Siguiente paso concreto:** Fase 6 cerrada del todo. Fase 8 (documentación) prácticamente cerrada — falta solo la verificación final de los 7 comandos en limpio. Queda pendiente decidir sobre Fase 7 (bonus) y `terraform destroy` de ambos entornos al cierre.
+
+---
+
+### 📄 Fase 8 — documentación final (avance de esta sesión)
+
+Se escribieron de una sola vez los 6 documentos de `oms-platform/`, cada uno basado en lectura directa de todo el código real (los 4 módulos de Terraform completos, los 3 playbooks de Ansible + el rol `oms_cloud_run`, el `Dockerfile`, y `ci-cd.yml`) — no son plantillas genéricas, cada afirmación remite a un archivo, un valor o un comando real:
+
+- **`README.md`**: reescrito por completo (el esqueleto original nunca se había rellenado). Incluye la sección "Decisiones" obligatoria con 3 trade-offs reales (Cloud Run vs GKE, Terraform como única fuente de verdad de cpu/memoria/instancias, doble control humano en el canary) y 3 cambios concretos sobre el borrador de IA (validación de región incompleta, módulos `google.cloud.gcp_cloudrun_*` inexistentes, `allowed_audiences` incorrecto de WIF) — los mismos hallazgos reales ya documentados en `BITACORA-COMANDOS.md`, pero redactados aquí para el lector del entregable, no como bitácora de sesión.
+- **`INFRA.md`** (nuevo): arquitectura real módulo por módulo (`network`/`database`/`compute`/`iam`), con la tabla real de diferencias staging/producción y el resumen de recursos aplicados (38 en la primera aplicación completa).
+- **`DEPLOYMENT.md`** (nuevo): flujo operativo completo — cómo funciona la idempotencia real de `oms_cloud_run` (comparación de 4 campos, no solo la imagen), los 3 playbooks, los 4 jobs de `ci-cd.yml`, y el segundo workflow `canary-decision.yml`, cerrando con la evidencia del ciclo completo verificado esta sesión.
+- **`OBSERVABILIDAD.md`** (nuevo): los 8 `database_flags` reales de Cloud SQL con su propósito cada uno, las 3 capas de healthcheck, y una admisión explícita de lo que NO está implementado (audit trail inmutable de REG-GDPR-003, degradación suave de Redis sin código de negocio que probarla).
+- **`CERTIFICADOS.md`** (nuevo): TLS del Load Balancer (certificado managed, estado real `PROVISIONING` sin dominio), WIF/OIDC completo con sus 2 hallazgos reales (audience incorrecto, `attribute_condition` incompleta), y Cosign keyless con el hallazgo de `cosign copy` para la firma cross-registro.
+- **`RETROSPECTIVA.md`** (nuevo): documento deliberadamente honesto — 3 desviaciones reales respecto a la spec (NFR-SCAL-001 por cuota real, audit trail no implementado, ausencia de módulos Ansible de Cloud Run), la deuda técnica conocida de `promote-canary.yml` (criterio de "primera revisión" en vez de "más tráfico"), y 4 puntos concretos de qué se haría distinto con el conocimiento actual.
+
+Pendiente de esta sub-tarea: releer los 6 documentos una vez más buscando inconsistencias entre sí (ej. mismos números, mismos nombres de revisión) antes de considerarlos definitivos para el video.
 
 > 📋 **Ver reporte completo de la Fase 5** (issues encontrados y cómo se resolvieron) al final de este archivo, sección "Reporte Fase 5 — completada de forma autónoma".
 > 📊 **`DIAGRAMAS.md` actualizado** con un nuevo diagrama de flujo (sección 2.bis) que muestra dónde se genera el build, cómo pasa por Terraform en la corrida inicial vs por Ansible en corridas subsecuentes, staging vs producción, el canary real, y el rollback — con círculos de color por tipo de corrida.
@@ -142,15 +157,17 @@ Se dio además una explicación pedagógica completa, línea por línea, de todo
 
 ### Fase 8 — Documentación final y cierre
 
-- [ ] README con sección "Decisiones" (3 trade-offs + 3 cambios al borrador de IA)
-- [ ] `INFRA.md`
-- [ ] `OBSERVABILIDAD.md`
-- [ ] `CERTIFICADOS.md` (evaluar si aplica tal cual lo define toscaprompt, dado que aquí el TLS lo gestiona el Load Balancer de GCP, no Traefik/mkcert)
-- [ ] `DEPLOYMENT.md`
+- [x] README con sección "Decisiones" (3 trade-offs reales + 3 cambios concretos al borrador de IA, todos verificables contra el código real)
+- [x] `INFRA.md` — arquitectura real por módulo (network/database/compute/iam), tabla de diferencias staging/producción, recursos aplicados
+- [x] `OBSERVABILIDAD.md` — logging real de Cloud SQL (8 database_flags), healthchecks en 3 capas, estado real del audit trail (no implementado, documentado como pendiente), SonarCloud
+- [x] `CERTIFICADOS.md` — TLS del Load Balancer (certificado managed, estado real PROVISIONING sin dominio), WIF/OIDC completo con sus 2 hallazgos reales, Cosign keyless y el hallazgo de `cosign copy`
+- [x] `DEPLOYMENT.md` — flujo operativo real: deploy.yml/rollback.yml/promote-canary.yml, los 4 jobs de ci-cd.yml, canary-decision.yml, evidencia del ciclo completo verificado
 - [x] `DIAGRAMAS.md` — adelantado durante la Fase 3, a petición del usuario: diagrama Mermaid de relación entre los 38 recursos aplicados, tabla resumen por módulo y glosario completo de términos. Documento vivo — se amplía en cada fase futura (Ansible, CI/CD, bonus)
-- [ ] `RETROSPECTIVA.md`
-- [ ] Verificación final de los 7 comandos del enunciado (sección 4)
+- [x] `RETROSPECTIVA.md` — desviaciones reales documentadas (NFR-SCAL-001, audit trail no implementado), deuda técnica conocida (criterio de promote-canary.yml), qué se haría distinto
+- [ ] Verificación final de los 7 comandos del enunciado (sección 4) — documentados en el README, pendiente de re-ejecutar los 7 en una sola pasada limpia para el video
 - [ ] Decidir si se destruye la infraestructura (`terraform destroy` + limpieza) para no agotar crédito, dejando todo documentado para reconstruir
+
+> Los 6 documentos de la Fase 8 (excepto `DIAGRAMAS.md`, ya existente) se escribieron en una sola sesión, basados en lectura directa del código real (todos los `.tf`, `.yml` de Ansible, `Dockerfile`, `ci-cd.yml`) — no son plantillas genéricas, cada afirmación es verificable contra un archivo o un comando real documentado en `BITACORA-COMANDOS.md`.
 
 ---
 
