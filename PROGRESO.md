@@ -8,7 +8,7 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 6 (CI/CD) — ✅ **COMPLETA**. Pipeline principal (`ci-cd.yml`) verificado de punta a punta contra GCP real, y el segundo workflow de decisión post-canary (`canary-decision.yml`) ya está escrito, validado y probado a nivel de playbook contra producción real. Falta solo el commit/push final de estos 2 archivos y, opcionalmente, dispararlo una vez de verdad desde la pestaña Actions de GitHub.
+**Fase en curso:** Fase 6 (CI/CD) — ✅ **COMPLETA Y CERRADA**. Ambos workflows (`ci-cd.yml` y `canary-decision.yml`) verificados de punta a punta como ejecuciones reales de GitHub Actions contra GCP real, no solo como playbooks locales.
 
 **Último hito completado:** El pipeline `ci-cd.yml` corrió de punta a punta (`ci` → `build` con Trivy+Cosign → `deploy-staging` → aprobación manual → `deploy-production`) tras 9 iteraciones de fixes reales, todos documentados en `BITACORA-COMANDOS.md` secciones 6.11–6.19. Verificado con `curl` real al healthcheck y `cosign verify` independiente de la firma en ambos registros (staging y producción).
 
@@ -25,15 +25,21 @@ Para soportar `promote` se creó `oms-platform/ansible/playbooks/promote-canary.
 
 El workflow `canary-decision.yml` mantiene a propósito el gate `environment: production` (doble control: dropdown manual + aprobador humano en GitHub) aunque sea redundante con la elección explícita del `workflow_dispatch` — decisión confirmada con el usuario.
 
-Se dio además una explicación pedagógica completa, línea por línea, de todo `.github/workflows/ci-cd.yml` (para que el usuario lo pueda defender en su video), cubriendo: qué es CI/CD, `strategy.matrix`, `needs`, `outputs` de job, el contexto `github.*`, el mecanismo completo de WIF, el ciclo firmar/verificar de Cosign, y por qué la seguridad real vive en el `attribute_condition` de GCP, no en el YAML. También se explicó en detalle el mecanismo del canary (por qué vive en Cloud Run como una revisión más, cómo se reparte el tráfico por porcentaje, y por qué la subida de 10% a 100% es una decisión humana y no un temporizador ni una condición automática de métricas).
+**Verificación real end-to-end de `canary-decision.yml` como workflow de GitHub Actions** (no solo local): se generó un build nuevo real (`0.2.0`→`0.3.0`, tag `v1.1.0`), se corrió el pipeline completo hasta dejar un canary real al 10% en producción, y se disparó `canary-decision.yml` por primera vez desde Actions. Aparecieron y se corrigieron **2 hallazgos reales nuevos** (documentados en `BITACORA-COMANDOS.md` § 6.21):
+1. **WIF rechazaba el token**: el `attribute_condition` del provider de producción solo aceptaba tags (`refs/tags/v*`), pero `canary-decision.yml` corre por `workflow_dispatch` sobre `main` (`refs/heads/main`). Corregido ampliando la condición (`attribute.event_name` agregado al mapping, condición con `||` para aceptar ambos casos legítimos), aplicado con `terraform apply` real desde WSL y verificado contra la API de GCP con `curl` autenticado.
+2. **`promote-canary.yml` rompía con 3 revisiones activas simultáneas**: el `awk` que identifica "la otra revisión" no estaba pensado para más de 2, y devolvía 2 líneas que Jinja2 pegaba mal dentro de `--to-revisions` (`Bad syntax for dict arg`). Corregido con `head -n1` (la revisión sobrante queda en 0% automáticamente en Cloud Run, sin necesidad de limpiarla antes).
 
-**Siguiente paso concreto:** (1) commitear y empujar `promote-canary.yml` y `canary-decision.yml` a ambos remotos, (2) opcionalmente disparar `canary-decision.yml` una vez de verdad desde GitHub Actions (nunca se ha ejecutado ahí, solo vía `ansible-playbook` local) para verificarlo también como workflow real, (3) continuar con Fase 7 (bonus) y Fase 8 (documentación final) según el tiempo disponible, (4) `terraform destroy` de ambos entornos al cierre.
+Tras ambos fixes, run exitoso final `36013855248`: canary promovido de 10% a 50% real, verificado contra la API de Cloud Run (`oms-production-00017-huk=50%`, `oms-production-00003-yod=50%`, la tercera revisión en 0%).
+
+Se dio además una explicación pedagógica completa, línea por línea, de todo `.github/workflows/ci-cd.yml` (para que el usuario lo pueda defender en su video), cubriendo: qué es CI/CD, `strategy.matrix`, `needs`, `outputs` de job, el contexto `github.*`, el mecanismo completo de WIF, el ciclo firmar/verificar de Cosign, y por qué la seguridad real vive en el `attribute_condition` de GCP, no en el YAML. También se explicó en detalle el mecanismo del canary (por qué vive en Cloud Run como una revisión más, cómo se reparte el tráfico por porcentaje, y por qué la subida de 10% a 100% es una decisión humana y no un temporizador ni una condición automática de métricas) — incluida la pregunta puntual de por qué una revisión en 0% de tráfico sigue existiendo sana en Cloud Run (no se invalida automáticamente: permite rollback instantáneo sin rebuild, y sos vos quien decide cuándo borrarla).
+
+**Siguiente paso concreto:** Fase 6 cerrada del todo. Continuar con Fase 7 (bonus) y Fase 8 (documentación final) según el tiempo disponible, y `terraform destroy` de ambos entornos al cierre.
 
 > 📋 **Ver reporte completo de la Fase 5** (issues encontrados y cómo se resolvieron) al final de este archivo, sección "Reporte Fase 5 — completada de forma autónoma".
 > 📊 **`DIAGRAMAS.md` actualizado** con un nuevo diagrama de flujo (sección 2.bis) que muestra dónde se genera el build, cómo pasa por Terraform en la corrida inicial vs por Ansible en corridas subsecuentes, staging vs producción, el canary real, y el rollback — con círculos de color por tipo de corrida.
 
 > 🗓️ **Pendiente para el cierre de hoy** (prioridad del usuario: terminar todo hoy porque tiene que grabar el video de explicación justo después):
-> 1. Commit/push de `promote-canary.yml` + `canary-decision.yml`.
+> 1. ~~Commit/push de `promote-canary.yml` + `canary-decision.yml`.~~ ✅ Hecho, incluyendo los 2 fixes de esta verificación.
 > 2. Fase 7 (bonus) si el tiempo alcanza.
 > 3. Fase 8 (documentación final: README con sección "Decisiones", `INFRA.md`, etc.) — mínimo indispensable si no da tiempo para todo.
 > 4. **`terraform destroy` de ambos entornos al final** — decisión ya tomada por el usuario (evitar seguir gastando el crédito de $300/90 días una vez grabado el video). Hacerlo en orden inverso de dependencias, y confirmar con `gcloud` que no queda ningún recurso huérfano facturable tras el destroy.

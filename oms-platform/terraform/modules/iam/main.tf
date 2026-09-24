@@ -52,13 +52,34 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.repository" = "assertion.repository"
     "attribute.ref"        = "assertion.ref"
     "attribute.actor"      = "assertion.actor"
+    "attribute.event_name" = "assertion.event_name"
   }
 
-  # 🔒 Restricción CRÍTICA: solo workflows de este repo concreto
-  # Y solo desde tags de release (refs/tags/v*).
+  # 🔒 Restricción CRÍTICA: solo workflows de este repo concreto.
+  #
+  # HALLAZGO REAL (Fase 6, ver BITACORA-COMANDOS.md § 6.21): al agregar
+  # canary-decision.yml (disparado por workflow_dispatch sobre la rama
+  # main, NO por un tag), la condición original —que solo aceptaba
+  # `assertion.ref.startsWith("refs/tags/v")`— rechazaba el token real
+  # con:
+  #   "unauthorized_client: The given credential is rejected by the
+  #    attribute condition."
+  # Correcto en su momento (pensada solo para ci-cd.yml), pero
+  # incompleta: no contemplaba un segundo flujo legítimo de producción.
+  # Se amplía para aceptar EXPLÍCITAMENTE dos casos, ambos ya protegidos
+  # por sus propios controles (no se relaja nada más):
+  #   1. Tags de release reales (refs/tags/v*) — dispara ci-cd.yml.
+  #   2. workflow_dispatch, pero SOLO si además corre sobre la rama
+  #      main (no cualquier rama/fork) — dispara canary-decision.yml.
+  # El gate `environment: production` (aprobación humana) sigue vigente
+  # en ambos casos igual que antes; esto solo decide qué credencial
+  # federada puede llegar a pedir esa aprobación.
   attribute_condition = <<-EOT
     assertion.repository == "${var.github_repository}" &&
-    assertion.ref.startsWith("refs/tags/v")
+    (
+      assertion.ref.startsWith("refs/tags/v") ||
+      (assertion.event_name == "workflow_dispatch" && assertion.ref == "refs/heads/main")
+    )
   EOT
 }
 

@@ -2901,3 +2901,69 @@ gcloud run services update-traffic oms-production --to-revisions=oms-production-
 - `target_percent=100` (default) → promoción completa, confirmado `100%` en la revisión canary, healthcheck sano.
 
 **Nuevo workflow `.github/workflows/canary-decision.yml`**, disparado manualmente (`workflow_dispatch`, nunca por push/tag) con dos inputs: `decision` (choice: `promote`/`rollback`) y `target_percent` (string, solo relevante si `decision=promote`, default `"100"`). Dos jobs condicionados por `if: inputs.decision == '...'`, cada uno con su propia autenticación WIF de producción (más simple que `deploy-production` de `ci-cd.yml`: no necesita autenticación dual con staging, porque no promociona ninguna imagen nueva, solo mueve tráfico entre revisiones ya existentes) y ejecutando el playbook correspondiente. Ambos jobs mantienen `environment: production` (decisión confirmada con el usuario: aunque elegir la opción en el dropdown ya es una decisión humana explícita, se prefiere mantener el mismo nivel de doble confirmación que el resto del proyecto antes de tocar producción).
+
+### 6.21 · Primera ejecución real de `canary-decision.yml` desde GitHub Actions — 2 hallazgos reales nuevos
+
+Todo lo de la sección 6.20 se había verificado corriendo `ansible-playbook` **localmente** contra producción real, pero el workflow de GitHub Actions en sí nunca se había disparado. Antes de darlo por cerrado, se generó un build nuevo real (bump `0.2.0` → `0.3.0` en `server.js`, mismo patrón de cambio sin riesgo que en la Fase 5), se etiquetó `v1.1.0`, se disparó el pipeline completo (`ci` → `build` → `deploy-staging` → aprobación manual → `deploy-production` con canary 10%) y, una vez con un canary real en producción, se disparó `canary-decision.yml` por primera vez desde la pestaña Actions con `decision=promote`, `target_percent=50`.
+
+**Hallazgo real 1 — `attribute_condition` de WIF rechazaba el token de `workflow_dispatch`:**
+
+```
+##[error]google-github-actions/auth failed with: failed to generate Google Cloud
+federated token for .../providers/github-provider: {"error":"unauthorized_client",
+"error_description":"The given credential is rejected by the attribute condition."}
+```
+
+Causa raíz real: el `attribute_condition` del provider de producción (`terraform/modules/iam/main.tf`) solo aceptaba `assertion.ref.startsWith("refs/tags/v")` — correcto para `ci-cd.yml` (que corre por tags), pero `canary-decision.yml` corre por `workflow_dispatch` sobre la rama `main`, cuyo `ref` real es `refs/heads/main`, no un tag. La condición lo rechazaba tal como está diseñada, no por ningún bug de GitHub o de la acción de autenticación.
+
+Corregido ampliando la condición (no relajándola sin control): se agregó `attribute.event_name` al `attribute_mapping` y se amplió `attribute_condition` para aceptar dos casos explícitos —
+
+```hcl
+attribute_condition = <<-EOT
+  assertion.repository == "${var.github_repository}" &&
+  (
+    assertion.ref.startsWith("refs/tags/v") ||
+    (assertion.event_name == "workflow_dispatch" && assertion.ref == "refs/heads/main")
+  )
+EOT
+```
+
+Es decir: tags de release (ci-cd.yml) **o** `workflow_dispatch` pero solo si corre sobre `main` (no cualquier rama o fork). El gate `environment: production` sigue aplicando en ambos casos igual que antes; esto solo decide qué credencial federada puede siquiera llegar a pedir esa aprobación.
+
+Aplicado con `terraform apply -target=module.iam.google_iam_workload_identity_pool_provider.github` desde WSL real (no Git Bash/MINGW64 — `terraform` no estaba en el `PATH` de esa terminal), verificado contra la API real de GCP con `curl` autenticado (no solo confiando en el resumen de `terraform apply`, que en este caso mostró `0 changed` por una desincronización entre el `plan` y el `apply` como invocaciones separadas — el estado real en GCP sí tenía el cambio, confirmado leyendo el recurso directamente):
+
+```bash
+curl -H "Authorization: Bearer $(gcloud auth application-default print-access-token)" \
+  "https://iam.googleapis.com/v1/projects/982350171486/locations/global/workloadIdentityPools/github-pool-production/providers/github-provider"
+# → attributeMapping ya incluye "attribute.event_name": "assertion.event_name"
+# → attributeCondition ya incluye la condición ampliada con el ||
+```
+
+**Hallazgo real 2 — `promote-canary.yml` rompía con 3 revisiones activas simultáneas:**
+
+Tras el fix de WIF, la autenticación pasó, pero el playbook falló en el paso final:
+
+```
+ERROR: (gcloud.run.services.update-traffic) argument --to-revisions:
+Bad syntax for dict arg: [oms-production-00003-yod].
+cmd: ["...", "--to-revisions=oms-production-00017-huk=50,oms-production-00003-yod", "oms-production-00008-qeb=50", ...]
+```
+
+Causa raíz real: producción tenía **3** revisiones listadas por `gcloud run services describe --flatten="status.traffic[]"` en ese momento (`oms-production-00008-qeb=90%`, `oms-production-00017-huk=10%` canary, y `oms-production-00003-yod` con 0% pero igual listada — resabio de rondas anteriores de pruebas de promote/rollback). El `awk` que identifica "la OTRA revisión" (`$1!=rev{print $1}`) no estaba diseñado para más de 2 revisiones totales, y devolvió **dos** líneas en vez de una; Jinja2 las insertó tal cual (con salto de línea) dentro de `--to-revisions`, generando un argumento inválido que `gcloud` interpretó como dos argumentos posicionales sueltos.
+
+Este bug no apareció en las pruebas locales de la sección 6.20 porque ahí siempre se probó con exactamente 2 revisiones activas — el escenario real de producción, tras varios ciclos de pruebas acumulados, ya tenía 3.
+
+Corregido en `promote-canary.yml` con `head -n1` sobre el `awk` (toma solo la primera "otra revisión") más `.split('\n')[0]` como segunda capa de defensa al componer `to_revisions_arg`. Cualquier revisión sobrante no mencionada en `--to-revisions` queda automáticamente en 0% en Cloud Run (comportamiento nativo, no hace falta limpiarla antes) — que es exactamente el estado deseado: solo el canary y una revisión estable deben quedarse con tráfico real.
+
+**Verificación final, contra la API real de Cloud Run (no solo el log de Ansible)**, tras reintentar el mismo run (`decision=promote`, `target_percent=50`):
+
+```bash
+curl -H "Authorization: Bearer $(gcloud auth application-default print-access-token)" \
+  "https://run.googleapis.com/v2/projects/acmeoms-production-fatm/locations/europe-west3/services/oms-production" \
+  | grep -E 'revision|percent'
+# → oms-production-00003-yod   percent: 50
+# → oms-production-00017-huk   percent: 50   (el canary, promovido de 10% a 50%)
+# → oms-production-00008-qeb   (listada, sin percent — quedó en 0%, ya no recibe tráfico)
+```
+
+✅ **`canary-decision.yml` verificado end-to-end como workflow real de GitHub Actions**, no solo como playbook local: run exitoso final `36013855248`, tras dos rondas de fixes reales (WIF + Ansible), cada uno con causa raíz confirmada y corrección verificada contra la API real de GCP.
