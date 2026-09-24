@@ -2826,3 +2826,78 @@ Permission 'artifactregistry.repositories.downloadArtifacts' denied on resource
 3. Valor real solo en `production.tfvars`: `staging_project_id = "acmeoms-staging-fatm"` — una excepción deliberada y documentada a la regla de "la única diferencia legítima entre tfvars es capacidad/endpoints", porque es un permiso cross-proyecto real, no una diferencia de configuración de recursos propios.
 
 Verificado con `terraform plan`: staging siguió en `No changes` (confirma que el `count=0` funciona), producción mostró `1 to add, 0 to change, 0 to destroy`. Aplicado contra producción real.
+
+### 6.19 · Noveno intento — ✅ PIPELINE COMPLETO EXITOSO DE PUNTA A PUNTA
+
+El usuario aprobó el gate manual por tercera vez. Esta vez, con los 8 hallazgos anteriores corregidos, el run completo terminó en éxito:
+
+```
+✓ CI — lint, validate, build de prueba (22-alpine)
+✓ CI — lint, validate, build de prueba (20-alpine)
+✓ Build, push a staging y firma (Cosign keyless)
+✓ Deploy → staging (Ansible)
+✓ Promote → producción (Ansible, canary 10%)
+```
+
+**Verificación completa contra GCP real (no solo el check verde de GitHub):**
+
+```bash
+gcloud run services describe oms-production --region=europe-west3 --project=acmeoms-production-fatm \
+  --flatten='status.traffic[]' --format='value(status.traffic.revisionName,status.traffic.percent,status.traffic.tag)'
+# → oms-production-00003-yod   90
+# → oms-production-00008-qeb   10   rev-8ce8620a   ← canary del 10% real, desplegado por el pipeline
+
+curl -sSi https://oms-production-ykq27zd2fq-ey.a.run.app/health
+# → HTTP/2 200, {"status":"ok","version":"0.2.0"}
+```
+
+**Verificación independiente de la firma** (instalando `cosign` localmente, sin depender del resultado del propio paso del pipeline):
+
+```bash
+cosign verify \
+  --certificate-identity-regexp="^https://github.com/ftoscanomarquez/acmeoms-infraestructura/.github/workflows/ci-cd.yml@.*$" \
+  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+  "europe-west3-docker.pkg.dev/acmeoms-production-fatm/oms/oms@sha256:8ce8620af8db778c9c790f060506ccdac493a592dbfda5b79fa4dbc9aa7ac6a0"
+```
+
+Confirmó los 3 checks (claims válidas, existencia en Rekor, certificado válido) y reveló un detalle interesante que confirma que `cosign copy` funcionó exactamente como se diseñó: el campo `docker-reference` dentro de la firma verificada en PRODUCCIÓN sigue diciendo `acmeoms-staging-fatm` — es decir, es literalmente la misma firma creada en el job `build` contra el registro de staging, preservada intacta (mismo certificado, mismo timestamp, mismo `SignedEntryTimestamp` de Rekor) tras la copia a producción. `githubWorkflowRef: "refs/tags/v1.0.0"` confirma la identidad exacta esperada.
+
+**Explicación pedagógica adicional dada al usuario durante esta fase**: mecanismo de canary de Cloud Run (revisiones, `--no-traffic` al crear + `update-traffic` como paso separado, reparto real de tráfico por petición), y aclaración explícita de que **la promoción del 10% al 100% NO es automática en este pipeline** — requiere un comando manual (`gcloud run services update-traffic --to-tags=...=100`), tal como se hizo manualmente en la Fase 5. Se identificó como mejora futura defendible: automatizar la promoción gradual con una condición real (ventana de observación + métricas de Cloud Monitoring) en vez de dejarla como intervención manual fuera del pipeline.
+
+**Estado final de la Fase 6 (pipeline principal): ✅ COMPLETA Y VERIFICADA DE PUNTA A PUNTA.** El pipeline `.github/workflows/ci-cd.yml` construye, escanea (Trivy config + Trivy image), firma (Cosign keyless), despliega a staging automáticamente, y promociona a producción con canary real tras aprobación manual — todo autenticado vía WIF sin ninguna credencial estática, verificado contra la API real de GCP y con verificación independiente de la firma. 9 iteraciones de disparo del tag `v1.0.0` fueron necesarias para llegar aquí, cada una con un hallazgo real distinto encontrado, diagnosticado y corregido — ninguno oculto ni ignorado.
+
+### 6.20 · Segundo workflow — decisión post-canary (promote gradual / rollback), a petición del usuario
+
+El usuario señaló correctamente un hueco real en el diseño: el pipeline principal deja el canary de producción en 10% y **ahí se detiene** — no hay ningún mecanismo, ni automático ni manual desde GitHub, para decidir después "promuévelo" o "retíralo". Se pidió explícitamente: (1) un segundo workflow con dos opciones (aceptar/promover o rollback), y (2) que la opción de promover acepte un **porcentaje** entre 11 y 100 (no solo 0/100 todo-o-nada) — con la lógica de que ≤10 no tendría efecto real (el pipeline ya deja el canary ahí) y que un valor menor al actual debería resolverse con rollback, no con un "promote" que en realidad reduce tráfico.
+
+**Nuevo playbook `oms-platform/ansible/playbooks/promote-canary.yml`**, hermano de `rollback.yml` (mismo estilo, misma fuente de verdad — `status.traffic[]` real, nunca el orden de creación):
+
+1. Valida `target_percent` en rango 11-100 (con default 100 para invocación manual sin especificarlo).
+2. Identifica la revisión candidata a canary como **la más recientemente creada** (mismo comando `gcloud run revisions list` que ya usa `rollback.yml` para encontrar "la activa", aplicado en sentido inverso).
+
+**Hallazgo real 1, detectado probando el diseño ANTES de darlo por bueno**: el primer intento de identificar el canary buscaba "la revisión que NO tiene el 100% de tráfico" — pero en un reparto real 90/10, **ninguna** revisión tiene el 100% (ni la vieja ni la nueva), así que ese filtro encontraba las dos. Corregido cruzando "la más reciente" contra su porcentaje actual, no contra un valor fijo de "100".
+
+**Hallazgo real 2, más importante, detectado probando `gcloud` directamente contra producción antes de escribir el YAML del comando**: se asumió inicialmente (y así quedó documentado por error en un comentario del propio código, antes de corregirlo) que `gcloud run services update-traffic --to-revisions=X=<parcial>`, sin mencionar la otra revisión, dejaría automáticamente el resto del tráfico en quien ya lo tenía. **Falso, confirmado con el error real de la API**:
+
+```bash
+gcloud run services update-traffic oms-production --to-revisions=oms-production-00008-qeb=40 --quiet
+# → ERROR: (gcloud.run.services.update-traffic) Every target with traffic is updated
+#   but 100% of traffic has not been specified.
+```
+
+Cloud Run exige que el 100% del tráfico quede explícitamente repartido entre las revisiones nombradas en la misma llamada. Corregido: el playbook ahora identifica también "la otra revisión" (`awk` filtrando por lo opuesto a la canary) y compone `--to-revisions=<canary>=<target>,<otra>=<100-target>` en una sola llamada — verificado y funcionando:
+
+```bash
+gcloud run services update-traffic oms-production --to-revisions=oms-production-00008-qeb=40,oms-production-00003-yod=60 --quiet
+# → éxito real, confirmado con `gcloud run services describe ... --flatten status.traffic[]`
+```
+
+3. Guarda adicional: si `target_percent` no es mayor que el porcentaje actual del canary, el playbook falla explícitamente ("esto sería reducir el canary, no promoverlo — usa rollback.yml").
+
+**Verificación real completa contra producción**, recreando el escenario de canary con `gcloud run services update-traffic --to-revisions=...=90,...=10` manualmente antes de cada prueba:
+- `target_percent=40` sobre un canary al 10% → éxito, tráfico confirmado en `40/60` vía `gcloud describe`.
+- `target_percent=5` (fuera de rango) → falla con el mensaje de validación esperado, sin tocar GCP.
+- `target_percent=20` sobre un canary ya al 40% → falla con el mensaje de "no reduce tráfico", sin tocar GCP.
+- `target_percent=100` (default) → promoción completa, confirmado `100%` en la revisión canary, healthcheck sano.
+
+**Nuevo workflow `.github/workflows/canary-decision.yml`**, disparado manualmente (`workflow_dispatch`, nunca por push/tag) con dos inputs: `decision` (choice: `promote`/`rollback`) y `target_percent` (string, solo relevante si `decision=promote`, default `"100"`). Dos jobs condicionados por `if: inputs.decision == '...'`, cada uno con su propia autenticación WIF de producción (más simple que `deploy-production` de `ci-cd.yml`: no necesita autenticación dual con staging, porque no promociona ninguna imagen nueva, solo mueve tráfico entre revisiones ya existentes) y ejecutando el playbook correspondiente. Ambos jobs mantienen `environment: production` (decisión confirmada con el usuario: aunque elegir la opción en el dropdown ya es una decisión humana explícita, se prefiere mantener el mismo nivel de doble confirmación que el resto del proyecto antes de tocar producción).

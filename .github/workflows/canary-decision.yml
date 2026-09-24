@@ -1,0 +1,122 @@
+---
+# ── .github/workflows/canary-decision.yml ───────────────────────────
+# Segundo workflow, disparado MANUALMENTE (nunca por push/tag), para
+# decidir qué hacer con el canary de producción tras observarlo:
+#   - "promote": sube el canary a un porcentaje mayor (hasta 100%).
+#   - "rollback": retira el canary por completo, volviendo el 100% del
+#     tráfico a la revisión anterior (ver playbooks/rollback.yml).
+#
+# Complementa a ci-cd.yml — ese pipeline deja el canary en 10% (o el
+# valor de group_vars/production.yml) y AHÍ SE DETIENE: no hay ninguna
+# promoción automática del 10% al 100% (confirmado explícitamente al
+# usuario — la subida es una decisión humana, no un temporizador ni una
+# condición automática basada en métricas). Este workflow es el punto de
+# control manual que faltaba: dispararlo cuando ya se observó el canary
+# el tiempo que se considere necesario, y decidir.
+#
+# Solo aplica a PRODUCCIÓN — staging siempre recibe el 100% del tráfico
+# de inmediato (big-bang, ver group_vars/staging.yml), nunca queda en un
+# estado de canary a medias.
+
+name: Canary Decision — OMS Platform
+
+on:
+  workflow_dispatch:
+    inputs:
+      decision:
+        description: "¿Qué hacer con el canary de producción?"
+        type: choice
+        required: true
+        options:
+          - promote
+          - rollback
+      target_percent:
+        description: >-
+          Solo si decision=promote: porcentaje de tráfico objetivo (11-100).
+          Ignorado si decision=rollback. 100 = promoción completa.
+        type: string
+        required: false
+        default: "100"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: europe-west3
+
+jobs:
+  promote:
+    name: "Promover canary al ${{ inputs.target_percent }}%"
+    if: inputs.decision == 'promote'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Validar target_percent antes de gastar minutos de runner (rango 11-100)"
+        # Falla rápido y con un mensaje claro aquí, en vez de dejar que el
+        # propio playbook de Ansible sea el primero en quejarse — mismo
+        # rango que valida promote-canary.yml, duplicado a propósito como
+        # primera línea de defensa barata (no requiere autenticación GCP).
+        run: |
+          if [ "${{ inputs.target_percent }}" -lt 11 ] || [ "${{ inputs.target_percent }}" -gt 100 ]; then
+            echo "::error::target_percent debe estar entre 11 y 100 (recibido: ${{ inputs.target_percent }})"
+            exit 1
+          fi
+
+      - name: "Autenticar en GCP (producción) vía WIF"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.PRODUCTION_WIF_PROVIDER }}
+          service_account: ${{ vars.PRODUCTION_CICD_SA }}
+
+      - name: "Configurar gcloud"
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: "Instalar Ansible + colecciones"
+        working-directory: oms-platform/ansible
+        run: |
+          pip install ansible-core
+          ansible-galaxy collection install -r requirements.yml
+
+      - name: "ansible-playbook promote-canary.yml -e env=production"
+        working-directory: oms-platform/ansible
+        env:
+          ANSIBLE_STDOUT_CALLBACK: default
+        run: |
+          ansible-playbook playbooks/promote-canary.yml \
+            -e env=production \
+            -e target_percent=${{ inputs.target_percent }}
+
+  rollback:
+    name: "Rollback del canary (100% a la revisión anterior)"
+    if: inputs.decision == 'rollback'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Autenticar en GCP (producción) vía WIF"
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.PRODUCTION_WIF_PROVIDER }}
+          service_account: ${{ vars.PRODUCTION_CICD_SA }}
+
+      - name: "Configurar gcloud"
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: "Instalar Ansible + colecciones"
+        working-directory: oms-platform/ansible
+        run: |
+          pip install ansible-core
+          ansible-galaxy collection install -r requirements.yml
+
+      - name: "ansible-playbook rollback.yml -e env=production"
+        working-directory: oms-platform/ansible
+        env:
+          ANSIBLE_STDOUT_CALLBACK: default
+        run: |
+          ansible-playbook playbooks/rollback.yml -e env=production

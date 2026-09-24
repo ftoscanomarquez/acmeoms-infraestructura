@@ -1,0 +1,199 @@
+---
+# ── playbook: promote-canary.yml ────────────────────────────────────
+# Sube el tráfico de la revisión en canary a `target_percent` (11-100),
+# tras haberla observado y considerarla sana. Permite promoción GRADUAL
+# (ej. 10% → 40% → 100% en pasos, observando entre cada uno), no solo
+# "todo o nada".
+#
+# Complementa a rollback.yml (misma lógica de detección, en sentido
+# opuesto): rollback.yml vuelve al 100% la revisión N-1 cuando el canary
+# resultó problemático; este playbook sube el canary MISMO cuando va bien.
+#
+# Uso:
+#   ansible-playbook playbooks/promote-canary.yml -e env=production
+#   ansible-playbook playbooks/promote-canary.yml -e env=production -e target_percent=40
+#
+# Rango válido de target_percent: 11-100.
+#   - NO se permite <=10: el propio pipeline de deploy.yml ya deja el
+#     canary en 10% (ver group_vars/production.yml) — pedir un valor igual
+#     o menor equivaldría a "no hacer nada". Si el canary se ve mal, la
+#     decisión correcta es rollback.yml, no bajar el porcentaje.
+#   - 100 es válido: es la promoción completa, el canary pasa a ser la
+#     única revisión con tráfico (el caso más común).
+#
+# Diseñado para el segundo workflow de GitHub Actions
+# (.github/workflows/canary-decision.yml) — el usuario dispara
+# manualmente ese workflow, elige "promote" (con un porcentaje) o
+# "rollback" en un dropdown, y el job correspondiente ejecuta este
+# playbook o rollback.yml.
+
+- name: "Promote canary OMS — {{ env | default('?') }}"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  vars_files:
+    - "../group_vars/all.yml"
+    - "../group_vars/{{ env }}.yml"
+
+  vars:
+    # Default 100 para no romper una invocación manual sin -e target_percent
+    # (comportamiento original: promoción completa).
+    target_percent: 100
+
+  tasks:
+    - name: "Validar entorno"
+      ansible.builtin.assert:
+        that:
+          - env is defined
+          - env in ['staging', 'production']
+
+    - name: "Validar target_percent (rango 11-100)"
+      ansible.builtin.assert:
+        that:
+          - (target_percent | int) >= 11
+          - (target_percent | int) <= 100
+        fail_msg: >-
+          target_percent debe estar entre 11 y 100 (recibido: {{ target_percent }}).
+          <=10 no tiene efecto real (el pipeline ya deja el canary en 10% —
+          usa rollback.yml si el canary se ve mal, no un porcentaje menor).
+          >100 no es un porcentaje de tráfico válido.
+
+    - name: "Leer el reparto de tráfico actual completo"
+      ansible.builtin.command:
+        cmd: >-
+          gcloud run services describe {{ cloud_run_service }}
+          --region={{ region }}
+          --flatten="status.traffic[]"
+          --format="value(status.traffic.revisionName,status.traffic.percent)"
+      register: traffic_result
+      changed_when: false
+
+    - name: "Listar todas las revisiones del servicio (más nueva primero)"
+      # Mismo comando que usa rollback.yml para encontrar "la activa" por
+      # posición en el historial — aquí se usa para encontrar "la más
+      # reciente", que es el candidato a canary.
+      ansible.builtin.command:
+        cmd: >-
+          gcloud run revisions list
+          --service={{ cloud_run_service }}
+          --region={{ region }}
+          --format=value(metadata.name)
+      register: all_revisions
+      changed_when: false
+
+    - name: "Fijar la revisión más reciente como candidata a canary"
+      ansible.builtin.set_fact:
+        newest_revision: "{{ all_revisions.stdout_lines[0] }}"
+
+    # HALLAZGO REAL (probado localmente antes de confiar en el diseño
+    # inicial): un primer intento buscaba "la revisión SIN el 100% de
+    # tráfico" — pero en un reparto real 90/10, NINGUNA revisión llega al
+    # 100% (ni la vieja ni la nueva), así que ese filtro encontraba las
+    # DOS revisiones en vez de una sola. El criterio correcto es cruzar
+    # "la revisión más reciente creada" (candidata) contra el porcentaje
+    # de tráfico que tiene ahora mismo — si es menor al 100%, es
+    # inequívocamente el canary (nunca hay más de un deploy pendiente de
+    # promoción a la vez en el diseño de este proyecto).
+    - name: "Obtener el porcentaje de tráfico de la revisión más reciente"
+      ansible.builtin.shell:
+        cmd: >-
+          echo "{{ traffic_result.stdout }}"
+          | awk -F'\t' -v rev="{{ newest_revision }}" '$1==rev{print $2}'
+      register: newest_revision_percent
+      changed_when: false
+      failed_when: false
+
+    - name: "Validar que la revisión más reciente está realmente en canary (no ya al 100%)"
+      ansible.builtin.assert:
+        that:
+          - newest_revision_percent.stdout | length > 0
+          - newest_revision_percent.stdout | int < 100
+        fail_msg: >-
+          La revisión más reciente ({{ newest_revision }}) no tiene tráfico
+          asignado por debajo del 100% en {{ cloud_run_service }} — no hay
+          ningún canary pendiente de promover. Estado actual del tráfico:
+          {{ traffic_result.stdout }}
+
+    - name: "Fijar la revisión canary como variable"
+      ansible.builtin.set_fact:
+        canary_revision: "{{ newest_revision }}"
+
+    # HALLAZGO REAL (probado contra el servicio real de producción antes de
+    # confiar en el diseño): `gcloud run services update-traffic
+    # --to-revisions=X=<parcial>` SIN mencionar también a la otra revisión
+    # FALLA con "Every target with traffic is updated but 100% of traffic
+    # has not been specified" — a diferencia de lo que se asumió al
+    # principio, Cloud Run NO reparte automáticamente el resto a quien ya
+    # lo tenía. Hay que nombrar AMBAS revisiones con AMBOS porcentajes,
+    # sumando exactamente 100%, en la misma llamada.
+    - name: "Identificar la OTRA revisión (la que tiene el resto del tráfico)"
+      ansible.builtin.shell:
+        cmd: >-
+          echo "{{ traffic_result.stdout }}"
+          | awk -F'\t' -v rev="{{ canary_revision }}" '$1!=rev{print $1}'
+      register: other_revision_result
+      changed_when: false
+      failed_when: false
+
+    - name: "Validar que solo target_percent < 100 requiere una segunda revisión"
+      # Si target_percent=100, no hace falta ninguna "otra revisión" — el
+      # canary se queda como la única con tráfico. Si target_percent<100 y
+      # no se encuentra una segunda revisión real, no hay a quién asignarle
+      # el resto — fallar explícito en vez de un update-traffic incompleto.
+      ansible.builtin.assert:
+        that:
+          - (target_percent | int) == 100 or (other_revision_result.stdout | length > 0)
+        fail_msg: >-
+          target_percent es {{ target_percent }} (<100) pero no se encontró
+          una segunda revisión a la que asignarle el resto del tráfico —
+          Cloud Run exige que el 100% del tráfico quede explícitamente
+          repartido entre revisiones nombradas.
+
+    - name: "Validar que target_percent sube el tráfico (no lo baja) respecto al actual"
+      # Otra guarda real: si alguien pidiera, por ejemplo, target_percent=20
+      # cuando el canary YA está al 50%, esto sería una regresión de
+      # tráfico disfrazada de "promoción" — no tiene sentido en este
+      # playbook (para bajar tráfico existe rollback.yml, que vuelve al
+      # 100% la revisión ANTERIOR, no reduce el canary a un valor parcial).
+      ansible.builtin.assert:
+        that:
+          - (target_percent | int) > (newest_revision_percent.stdout | int)
+        fail_msg: >-
+          target_percent ({{ target_percent }}) no es mayor que el tráfico
+          actual del canary ({{ newest_revision_percent.stdout }}%) — esto
+          sería reducir el canary, no promoverlo. Usa rollback.yml si la
+          intención es retirar el canary por completo.
+
+    - name: "Componer el argumento --to-revisions (100% si target=100, ambas revisiones si no)"
+      ansible.builtin.set_fact:
+        to_revisions_arg: >-
+          {{
+            canary_revision ~ '=' ~ target_percent
+            if (target_percent | int) == 100
+            else canary_revision ~ '=' ~ target_percent ~ ',' ~ other_revision_result.stdout ~ '=' ~ (100 - (target_percent | int))
+          }}
+
+    - name: "Mostrar plan de promoción antes de aplicarlo"
+      ansible.builtin.debug:
+        msg: |
+          Revisión en canary a promover: {{ canary_revision }}
+          Tráfico actual del canary:     {{ newest_revision_percent.stdout }}%
+          Tráfico objetivo del canary:   {{ target_percent }}%
+          Argumento --to-revisions:      {{ to_revisions_arg }}
+
+    - name: "Asignar el tráfico objetivo (ambas revisiones sumando 100%)"
+      # --to-revisions (no --to-tags): apuntamos por nombre de revisión ya
+      # existente, no por un tag recién asignado en este mismo run — mismo
+      # patrón que usa rollback.yml para el mismo tipo de operación.
+      ansible.builtin.command:
+        cmd: >-
+          gcloud run services update-traffic {{ cloud_run_service }}
+          --region={{ region }}
+          --to-revisions={{ to_revisions_arg }}
+          --quiet
+      register: promote_result
+      changed_when: "'No changes' not in promote_result.stderr"
+
+    - name: "Anunciar promoción"
+      ansible.builtin.debug:
+        msg: "Canary en {{ env }} ahora al {{ target_percent }}% de tráfico (revisión {{ canary_revision }})."

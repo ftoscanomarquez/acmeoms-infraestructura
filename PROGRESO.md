@@ -8,25 +8,32 @@
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 6 (CI/CD) — pipeline completo, endurecido con Trivy, y con fixes reales de seguridad ya aplicados contra GCP. Falta solo disparar el tag `v1.0.0`.
-**Último hito completado:** El usuario configuró manualmente en GitHub las 6 Repository Variables y el `environment: production` (con "Required reviewers" — se hizo el repo público porque esa función no está disponible para repos privados en el plan gratuito). Primer `git push` real a ambos remotos: el job `ci` corrió y pasó correctamente (ambas entradas de la matriz de Node), y `build`/`deploy-staging`/`deploy-production` quedaron `skipped` como se esperaba (push normal a `main`, no un tag).
+**Fase en curso:** Fase 6 (CI/CD) — ✅ **COMPLETA**. Pipeline principal (`ci-cd.yml`) verificado de punta a punta contra GCP real, y el segundo workflow de decisión post-canary (`canary-decision.yml`) ya está escrito, validado y probado a nivel de playbook contra producción real. Falta solo el commit/push final de estos 2 archivos y, opcionalmente, dispararlo una vez de verdad desde la pestaña Actions de GitHub.
 
-Después, a petición del usuario, se **endureció el pipeline con dos escáneres reales de Trivy** (gratis, sin cuenta externa): `trivy config` contra Terraform (job `ci`) y `trivy image` contra la imagen Docker real (job `build`, antes de firmarla con Cosign). Esto llevó a **3 correcciones de seguridad reales, aplicadas contra GCP real en staging y producción**:
-1. Cloud SQL sin `ssl_mode=ENCRYPTED_ONLY` (HIGH) — corregido, aplicado, verificado sano en ambos entornos.
-2. `roles/iam.serviceAccountUser` otorgado a nivel de PROYECTO completo en vez de acotado al SA de runtime (MEDIUM) — corregido con un binding específico de recurso, aplicado y verificado en ambos entornos.
-3. 4 flags de logging de Cloud SQL faltantes — agregados.
+**Último hito completado:** El pipeline `ci-cd.yml` corrió de punta a punta (`ci` → `build` con Trivy+Cosign → `deploy-staging` → aprobación manual → `deploy-production`) tras 9 iteraciones de fixes reales, todos documentados en `BITACORA-COMANDOS.md` secciones 6.11–6.19. Verificado con `curl` real al healthcheck y `cosign verify` independiente de la firma en ambos registros (staging y producción).
 
-Los CVEs de la imagen base (`node:22-alpine`, la más reciente publicada) que no son responsabilidad nuestra (8 CVEs, todos del `npm` interno, ninguno de nuestro código) se documentaron uno por uno en `oms-platform/docker/.trivyignore`, en vez de bajar el umbral de severidad — así el escáner sigue bloqueando de verdad cualquier CVE real futuro. También se agregó (a petición del usuario) un paso de SonarCloud **cableado pero deshabilitado a propósito** (`if: vars.SONAR_HOST_URL != ''`), documentando por qué no se activa todavía (sin código de negocio real que analizar).
+Después, a petición del usuario, se construyó el **segundo workflow de decisión post-canary** (`canary-decision.yml`), que resuelve el hueco que el propio usuario identificó: el `ci-cd.yml` deja el canary de producción en 10% y ahí se detiene — no hay ninguna promoción automática. El nuevo workflow, disparado solo por `workflow_dispatch`, ofrece 2 decisiones humanas:
+- **`promote`**: sube el canary a un `target_percent` capturado por input, validado estrictamente en **rango 11–100** (11 porque bajarlo o dejarlo en 10 equivaldría a no hacer nada; 100 porque en ese punto el canary pasa a ser la revisión oficial).
+- **`rollback`**: retira el canary por completo, devolviendo el 100% del tráfico a la revisión anterior (reutiliza `rollback.yml` ya existente).
 
-Se dio además una explicación pedagógica completa, línea por línea, de todo `.github/workflows/ci-cd.yml` (para que el usuario lo pueda defender en su video), cubriendo: qué es CI/CD, `strategy.matrix`, `needs`, `outputs` de job, el contexto `github.*`, el mecanismo completo de WIF, el ciclo firmar/verificar de Cosign, y por qué la seguridad real vive en el `attribute_condition` de GCP, no en el YAML.
+Para soportar `promote` se creó `oms-platform/ansible/playbooks/promote-canary.yml`, con lógica para detectar la revisión candidata (la más reciente creada, cruzada con su % de tráfico actual — no por tag manual), calcular el argumento `--to-revisions` sumando ambas revisiones a 100% explícito, y bloquear cualquier intento de bajar el tráfico en vez de subirlo. Se verificó con **pruebas reales contra `acmeoms-production-fatm`**:
+1. Canary al 10% → promovido a 40% (`oms-production-00008-qeb=40,oms-production-00003-yod=60`) — ✅ éxito.
+2. Intento con 5% → rechazado por el `assert` de rango (11-100) — ✅ bloqueo correcto.
+3. Intento de 20% estando ya en 40% → rechazado por el `assert` de "sube, no baja" — ✅ bloqueo correcto.
+4. Canary al 40% → promovido a 100% (default) → producción quedó en `oms-production-00008-qeb` al 100% limpio, healthcheck `{"status":"ok","version":"0.2.0"}` — ✅ éxito.
+5. **Rollback real ejecutado también**: desde 100% en `oms-production-00008-qeb`, `rollback.yml` identificó correctamente la N-1 (`oms-production-00003-yod`, no la más reciente creada, sino la anterior a la activa) y le devolvió el 100% del tráfico — ✅ verificado con `ansible-playbook` real, `changed=1`, sin fallos.
 
-**Siguiente paso concreto:** (1) commitear y empujar todos los cambios de esta sesión a ambos remotos (`origin`/GitLab y `github`), (2) crear y empujar el tag `git tag v1.0.0 && git push github v1.0.0` para disparar el pipeline completo por primera vez, (3) verificar en la pestaña Actions que `ci` → `build` (con Trivy+Cosign) → `deploy-staging` corren correctamente, y que `deploy-production` queda pausado esperando la aprobación manual del usuario, (4) verificar el resultado real contra la API de GCP tras aprobar.
+El workflow `canary-decision.yml` mantiene a propósito el gate `environment: production` (doble control: dropdown manual + aprobador humano en GitHub) aunque sea redundante con la elección explícita del `workflow_dispatch` — decisión confirmada con el usuario.
+
+Se dio además una explicación pedagógica completa, línea por línea, de todo `.github/workflows/ci-cd.yml` (para que el usuario lo pueda defender en su video), cubriendo: qué es CI/CD, `strategy.matrix`, `needs`, `outputs` de job, el contexto `github.*`, el mecanismo completo de WIF, el ciclo firmar/verificar de Cosign, y por qué la seguridad real vive en el `attribute_condition` de GCP, no en el YAML. También se explicó en detalle el mecanismo del canary (por qué vive en Cloud Run como una revisión más, cómo se reparte el tráfico por porcentaje, y por qué la subida de 10% a 100% es una decisión humana y no un temporizador ni una condición automática de métricas).
+
+**Siguiente paso concreto:** (1) commitear y empujar `promote-canary.yml` y `canary-decision.yml` a ambos remotos, (2) opcionalmente disparar `canary-decision.yml` una vez de verdad desde GitHub Actions (nunca se ha ejecutado ahí, solo vía `ansible-playbook` local) para verificarlo también como workflow real, (3) continuar con Fase 7 (bonus) y Fase 8 (documentación final) según el tiempo disponible, (4) `terraform destroy` de ambos entornos al cierre.
 
 > 📋 **Ver reporte completo de la Fase 5** (issues encontrados y cómo se resolvieron) al final de este archivo, sección "Reporte Fase 5 — completada de forma autónoma".
 > 📊 **`DIAGRAMAS.md` actualizado** con un nuevo diagrama de flujo (sección 2.bis) que muestra dónde se genera el build, cómo pasa por Terraform en la corrida inicial vs por Ansible en corridas subsecuentes, staging vs producción, el canary real, y el rollback — con círculos de color por tipo de corrida.
 
 > 🗓️ **Pendiente para el cierre de hoy** (prioridad del usuario: terminar todo hoy porque tiene que grabar el video de explicación justo después):
-> 1. Disparar el tag `v1.0.0` y verificar el pipeline completo de punta a punta.
+> 1. Commit/push de `promote-canary.yml` + `canary-decision.yml`.
 > 2. Fase 7 (bonus) si el tiempo alcanza.
 > 3. Fase 8 (documentación final: README con sección "Decisiones", `INFRA.md`, etc.) — mínimo indispensable si no da tiempo para todo.
 > 4. **`terraform destroy` de ambos entornos al final** — decisión ya tomada por el usuario (evitar seguir gastando el crédito de $300/90 días una vez grabado el video). Hacerlo en orden inverso de dependencias, y confirmar con `gcloud` que no queda ningún recurso huérfano facturable tras el destroy.
