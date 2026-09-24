@@ -134,6 +134,25 @@ resource "google_service_account_iam_member" "cicd_act_as_runtime" {
   member             = "serviceAccount:${google_service_account.cicd.email}"
 }
 
+# HALLAZGO REAL (Fase 6, ver BITACORA-COMANDOS.md § 6.16): el pre_task de
+# playbooks/deploy.yml (Fase 5) ejecuta `terraform init`/`terraform output`
+# para leer cpu/memory/instancias como fuente de verdad — eso exige que el
+# SA que corre Ansible pueda LEER el bucket de estado remoto de Terraform.
+# Nunca se le había dado ese permiso: hasta la Fase 5, Terraform solo se
+# ejecutaba con la cuenta humana del desarrollador (con permisos amplios de
+# owner/editor a nivel de cuenta personal), nunca con el SA de CI/CD. Sin
+# este binding, `terraform init -reconfigure` fallaba en el pipeline real:
+#   "403: ...cicd@... does not have storage.objects.list access to the
+#    Google Cloud Storage bucket ...-tfstate"
+# Se otorga SOLO lectura (roles/storage.objectViewer), acotada al bucket
+# específico de este entorno (no a todo el proyecto) — el pre_task únicamente
+# LEE outputs, nunca aplica ni modifica el estado real.
+resource "google_storage_bucket_iam_member" "cicd_tfstate_reader" {
+  bucket = "${var.project_id}-tfstate"
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.cicd.email}"
+}
+
 # ─── Permisos del SA del Cloud Run runtime ───────────────────────
 # El runtime SOLO necesita leer secretos y conectar a Cloud SQL.
 resource "google_project_iam_member" "runtime_sql_client" {

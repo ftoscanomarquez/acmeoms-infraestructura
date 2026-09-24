@@ -2744,3 +2744,30 @@ Con el callback corregido, `ansible-playbook` arrancó de verdad y avanzó hasta
 **Corrección:** se agregó `uses: hashicorp/setup-terraform@v3` en ambos jobs de despliegue, antes de la autenticación WIF en `deploy-staging` (donde se ejecuta justo después de `google-github-actions/auth`) y justo después del checkout en `deploy-production` (no depende de ninguna credencial GCP, solo instala el binario).
 
 **Patrón que se repite en esta fase**: cada uno de los hallazgos 6.11 a 6.15 es la misma categoría de error — algo que en local "simplemente funcionaba" porque el entorno de la sesión de trabajo ya tenía preinstalado o preconfigurado lo necesario (Terraform, las colecciones de Ansible, el `ANSIBLE_CONFIG`, la variable de audience correcta), pero que nunca se verificó explícitamente contra una máquina limpia hasta ejecutar el pipeline real. Confirma en la práctica por qué "funciona en mi máquina" no es suficiente para CI/CD — cada job es, literalmente, una máquina que nunca ha visto nada de esto antes.
+
+### 6.16 · Sexto intento — hallazgo real: el SA de CI/CD no tenía permiso de lectura sobre el bucket de tfstate
+
+Con Terraform instalado, el pre_task `terraform init` arrancó de verdad contra el backend remoto, pero falló con un 403 real de permisos:
+
+```
+Error: Failed to get existing workspaces: querying Cloud Storage failed: googleapi: Error 403:
+oms-staging-cicd@acmeoms-staging-fatm.iam.gserviceaccount.com does not have storage.objects.list
+access to the Google Cloud Storage bucket. Permission 'storage.objects.list' denied on resource
+'//storage.googleapis.com/projects/_/buckets/acmeoms-staging-fatm-tfstate' (or it may not exist).
+```
+
+**Causa — esta vez no es un olvido de configuración del pipeline, sino un permiso real que nunca hizo falta hasta ahora.** Desde la Fase 1, todo `terraform init`/`apply`/`plan` se ejecutó con la cuenta humana del desarrollador autenticada vía `gcloud auth login` (con acceso amplio a nivel de cuenta de Google), nunca con el Service Account de CI/CD. El pre_task de `deploy.yml` (Fase 5, lectura de `cpu`/`memory`/instancias vía `terraform output`) introdujo la PRIMERA vez que algo distinto a un humano necesita tocar el backend remoto de Terraform — y el SA de CI/CD, diseñado con mínimo privilegio (Cloud Run, Artifact Registry, actuar-como el SA de runtime), nunca tuvo ningún permiso sobre Cloud Storage.
+
+**Decisión de diseño (confirmada con el usuario):** otorgar `roles/storage.objectViewer` (solo lectura) acotado al bucket específico de tfstate de cada entorno — no `objectAdmin` (que permitiría escribir/borrar estado) y no a nivel de proyecto completo (que daría acceso a cualquier otro bucket). Coherente con el mismo patrón de mínimo privilegio ya aplicado en toda la Fase 6 (el `roles/iam.serviceAccountUser` acotado de la sección 6.9, por ejemplo).
+
+```hcl
+resource "google_storage_bucket_iam_member" "cicd_tfstate_reader" {
+  bucket = "${var.project_id}-tfstate"
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.cicd.email}"
+}
+```
+
+Verificado con `terraform plan`: `1 to add, 0 to change, 0 to destroy` en ambos entornos (recurso nuevo y aislado, sin tocar nada existente). Aplicado contra staging y producción reales.
+
+**Reflexión para el video**: este hallazgo es cualitativamente distinto a los 5 anteriores — no fue un olvido de "copiar el paso al pipeline", sino una consecuencia directa y correcta del diseño de mínimo privilegio: el SA de CI/CD *nunca debió* tener permisos que no usa, así que cuando una nueva funcionalidad (leer `terraform output`) necesitó un permiso nuevo, el sistema correctamente lo rechazó hasta que se otorgó explícitamente — el fallo de IAM funcionó exactamente como debía, obligando a una decisión consciente en vez de un acceso implícito.
