@@ -7,6 +7,12 @@ variable "env" { type = string }
 variable "github_repository" { type = string } # formato "owner/repo"
 variable "cloud_run_sa" { type = string }      # email del SA del runtime
 variable "labels" { type = map(string) }
+# Ver comentario completo en terraform/variables.tf — vacío en staging,
+# solo se usa en producción para el permiso cross-proyecto de `cosign copy`.
+variable "staging_project_id" {
+  type    = string
+  default = ""
+}
 
 # ─── Workload Identity Pool ──────────────────────────────────────
 resource "google_iam_workload_identity_pool" "github" {
@@ -151,6 +157,29 @@ resource "google_storage_bucket_iam_member" "cicd_tfstate_reader" {
   bucket = "${var.project_id}-tfstate"
   role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.cicd.email}"
+}
+
+# HALLAZGO REAL (Fase 6, ver BITACORA-COMANDOS.md § 6.18): `cosign copy`
+# (paso "Copiar la firma original al registro de producción" del workflow)
+# necesita LEER del Artifact Registry de STAGING y ESCRIBIR en el de
+# PRODUCCIÓN dentro de la misma llamada — pero el pipeline solo mantiene
+# una identidad de GCP activa a la vez (o staging, o producción, nunca
+# ambas simultáneamente). Falló con:
+#   "DENIED: Permission 'artifactregistry.repositories.downloadArtifacts'
+#    denied on resource '.../projects/acmeoms-staging-fatm/.../oms'"
+# porque en el momento de `cosign copy`, la sesión activa ya era la de
+# producción (re-autenticada en el paso anterior), sin ningún permiso
+# sobre el proyecto de staging. Se resuelve dando al SA de CI/CD de
+# PRODUCCIÓN un permiso de solo lectura, cross-proyecto, sobre el
+# Artifact Registry de staging — el patrón real de "promoción entre
+# entornos": el destino necesita permiso explícito para leer del origen.
+# `count` lo condiciona a que exista `staging_project_id` (solo se pasa en
+# production.tfvars); en staging, este recurso simplemente no se crea.
+resource "google_project_iam_member" "cicd_read_staging_registry" {
+  count   = var.staging_project_id != "" ? 1 : 0
+  project = var.staging_project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.cicd.email}"
 }
 
 # ─── Permisos del SA del Cloud Run runtime ───────────────────────

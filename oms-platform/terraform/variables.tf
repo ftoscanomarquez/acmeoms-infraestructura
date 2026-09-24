@@ -111,6 +111,20 @@ variable "github_repository" {
   default     = "acme-org/oms-platform"
 }
 
+# HALLAZGO REAL (Fase 6, ver BITACORA-COMANDOS.md § 6.18): la promoción de
+# imagen a producción incluye copiar también la FIRMA de Cosign con
+# `cosign copy` (la firma no viaja con un simple docker tag+push, ver
+# hallazgo 6.17) — esa operación necesita LEER del Artifact Registry de
+# staging y ESCRIBIR en el de producción en la misma llamada. Solo tiene
+# sentido en `production.tfvars` (staging no necesita leer de sí mismo);
+# se deja vacío por defecto para que aplicar el módulo en staging no
+# intente crear un binding sin sentido.
+variable "staging_project_id" {
+  type        = string
+  description = "ID del proyecto GCP de staging — SOLO usado en producción, para dar al SA de CI/CD de producción permiso de lectura sobre el Artifact Registry de staging (necesario para 'cosign copy' al promocionar). Vacío en staging."
+  default     = ""
+}
+
 # Agregado por el equipo (Fase 2): dominio para el certificado SSL managed
 # del Load Balancer. Requiere un dominio real registrado (no lo cubre GCP)
 # con un registro DNS tipo A hacia la IP del Load Balancer — ver

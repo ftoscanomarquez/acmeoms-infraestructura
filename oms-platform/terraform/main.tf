@@ -111,9 +111,10 @@ module "compute" {
 module "iam" {
   source = "./modules/iam"
 
-  project_id        = var.project_id
-  env               = var.env
-  github_repository = var.github_repository
-  cloud_run_sa      = module.compute.cloud_run_service_account
-  labels            = local.common_labels
+  project_id         = var.project_id
+  env                = var.env
+  github_repository  = var.github_repository
+  cloud_run_sa       = module.compute.cloud_run_service_account
+  labels             = local.common_labels
+  staging_project_id = var.staging_project_id
 }

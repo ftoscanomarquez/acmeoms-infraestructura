@@ -2797,3 +2797,32 @@ Error: no signatures found
 ```
 
 Insertado entre "Promocionar la imagen" y "Verificar la firma en el registro de producción" (que se mantiene sin cambios, ahora sí encontrará la firma).
+
+### 6.18 · Octavo intento — el usuario aprobó de nuevo; `cosign copy` requiere acceso simultáneo a dos proyectos
+
+El usuario aprobó el gate manual por segunda vez. El job avanzó hasta el nuevo paso "Copiar la firma original al registro de producción", que falló:
+
+```
+Error: GET https://europe-west3-docker.pkg.dev/v2/token?...: DENIED:
+Permission 'artifactregistry.repositories.downloadArtifacts' denied on resource
+'.../projects/acmeoms-staging-fatm/.../repositories/oms' (or it may not exist)
+```
+
+**Causa — un problema estructural, no un olvido puntual.** `cosign copy <origen> <destino>` necesita LEER del registro origen (staging) y ESCRIBIR en el destino (producción) dentro de la misma llamada. Pero el pipeline solo mantiene **una** identidad de GCP activa a la vez: en el momento de este paso, la sesión ya había sido re-autenticada como el SA de producción (paso "Re-autenticar en GCP (producción)..."), que no tiene ningún permiso sobre el proyecto de staging.
+
+**Decisión de diseño (confirmada con el usuario, entre 2 alternativas):** otorgar al SA de CI/CD de **producción** un permiso de solo lectura, cross-proyecto, sobre el Artifact Registry de **staging** (`roles/artifactregistry.reader`) — es el patrón real de "promoción entre entornos": el destino necesita permiso explícito para leer del origen, en vez de intentar mantener dos sesiones de autenticación activas a la vez (más complejo y menos fiable).
+
+**Implementación:**
+1. Nueva variable `staging_project_id` en `terraform/variables.tf` (default `""`, para que staging nunca cree este recurso al aplicarse sobre sí mismo).
+2. Nuevo recurso condicional en el módulo `iam`, con `count = var.staging_project_id != "" ? 1 : 0`:
+   ```hcl
+   resource "google_project_iam_member" "cicd_read_staging_registry" {
+     count   = var.staging_project_id != "" ? 1 : 0
+     project = var.staging_project_id
+     role    = "roles/artifactregistry.reader"
+     member  = "serviceAccount:${google_service_account.cicd.email}"
+   }
+   ```
+3. Valor real solo en `production.tfvars`: `staging_project_id = "acmeoms-staging-fatm"` — una excepción deliberada y documentada a la regla de "la única diferencia legítima entre tfvars es capacidad/endpoints", porque es un permiso cross-proyecto real, no una diferencia de configuración de recursos propios.
+
+Verificado con `terraform plan`: staging siguió en `No changes` (confirma que el `count=0` funciona), producción mostró `1 to add, 0 to change, 0 to destroy`. Aplicado contra producción real.

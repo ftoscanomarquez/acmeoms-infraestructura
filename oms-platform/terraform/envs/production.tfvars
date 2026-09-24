@@ -50,3 +50,13 @@ image_sha  = "sha256:d68ca4fc59a42a8f6bb74e9f82d937f545315230c7bc214880d1310907c
 deletion_protection = true # innegociable
 
 github_repository = "ftoscanomarquez/acmeoms-infraestructura"
+
+# HALLAZGO REAL (Fase 6, ver BITACORA-COMANDOS.md § 6.18): necesario para
+# que el SA de CI/CD de producción pueda leer el Artifact Registry de
+# staging al ejecutar `cosign copy` (copiar la firma original al
+# promocionar la imagen). Excepción DELIBERADA a la regla de arriba
+# ("la única diferencia legítima es...") — es un permiso cross-proyecto
+# real, no una diferencia de capacidad/endpoints; se documenta aquí en
+# vez de en staging.tfvars porque solo producción necesita leer de otro
+# proyecto (staging nunca necesita leer de sí mismo).
+staging_project_id = "acmeoms-staging-fatm"
