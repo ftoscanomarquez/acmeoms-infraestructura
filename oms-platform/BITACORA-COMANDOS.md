@@ -2631,3 +2631,17 @@ El usuario preguntó explícitamente si Trivy permite marcar excepciones documen
 **Resultado final**: el paso en el pipeline usa `severity: CRITICAL,HIGH`, `exit-code: 1` y `trivyignores: oms-platform/docker/.trivyignore` — bloquea de verdad cualquier CVE CRITICAL/HIGH que no esté explícitamente excluido y documentado, incluyendo cualquier CVE futuro en una dependencia real que el proyecto llegue a declarar.
 
 **Estado final de la Fase 6 (documentación de este apartado): dos escáneres Trivy reales y activos (no simulados) en el pipeline, con 3 hallazgos reales de seguridad corregidos de verdad contra GCP (SSL de Cloud SQL, permisos IAM excesivos, logging faltante) y 8 CVEs de la imagen base documentados y excluidos con justificación individual — ningún hallazgo real se ignoró sin registro.
+
+### 6.10 · Hallazgo real — versión inexistente de `aquasecurity/trivy-action`
+
+Tras el push del commit que agregaba Trivy al pipeline, el job `ci` falló en solo 2 segundos por entorno de la matriz — demasiado rápido para que Trivy hubiera corrido de verdad, señal de un error de resolución temprana:
+
+```
+Unable to resolve action `aquasecurity/trivy-action@0.28.0`, unable to find version `0.28.0`
+```
+
+**Causa:** se referenció la versión como `@0.28.0` (sin el prefijo `v`), pero las etiquetas reales de ese repositorio siguen el formato `v0.28.0`, `v0.36.0`, etc. Verificado con `gh api repos/aquasecurity/trivy-action/tags` antes de corregir a ciegas — se confirmaron las 15 versiones más recientes disponibles, y se actualizó a `@v0.36.0` (la más reciente en el momento), en vez de simplemente añadir el prefijo a la versión ya obsoleta que se había escrito de memoria.
+
+Se aprovechó también para verificar contra el `action.yaml` real del repositorio (`gh api repos/aquasecurity/trivy-action/contents/action.yaml`) que los inputs usados (`scan-type`, `scan-ref`, `image-ref`, `severity`, `exit-code`, `trivyignores`) existen tal cual en esa acción — ninguno estaba mal escrito, solo la referencia de versión.
+
+**Lección:** al referenciar una acción de terceros por primera vez, verificar el tag real con `gh api repos/<owner>/<repo>/tags` (o revisando el repositorio directamente) en vez de asumir un número de versión de memoria — un error de un solo carácter (`v` faltante) hace fallar el job antes de ejecutar ningún paso real, sin relación aparente con el contenido de la configuración.

@@ -118,7 +118,7 @@ jobs:
         # nivel de proyecto, acotado al recurso específico) — los MEDIUM/LOW
         # restantes (VPC Flow Logs deshabilitados, log_statement=ddl) son
         # decisiones conscientes documentadas, no bloquean el pipeline.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: oms-platform/terraform
@@ -227,7 +227,7 @@ jobs:
         # que este paso SÍ bloquee cualquier CVE nuevo real que aparezca en
         # el futuro (de nuestro código, de una dependencia que lleguemos a
         # declarar, o de un cambio en la imagen base).
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: ${{ steps.full_ref.outputs.value }}
