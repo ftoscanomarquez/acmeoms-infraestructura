@@ -38,7 +38,13 @@ const PORT = process.env.PORT || 8080;
 // confirmar a simple vista qué revisión/imagen responde realmente tras
 // cada despliegue. No cambia el status code, el content-type, ni la
 // estructura base que ya validan las probes/healthchecks existentes.
-const BUILD_VERSION = '0.2.0';
+//
+// 0.3.0 (Fase 6, verificación real del workflow canary-decision.yml):
+// mismo cambio sin riesgo, solo el número de versión, para generar un
+// build nuevo y disparar el pipeline completo una vez más, dejando en
+// producción un canary real al 10% sobre el que probar el workflow de
+// decisión (promote/rollback) por primera vez desde GitHub Actions.
+const BUILD_VERSION = '0.3.0';
 
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
