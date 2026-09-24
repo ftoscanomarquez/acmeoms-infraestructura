@@ -309,6 +309,16 @@ jobs:
 
       - name: "ansible-playbook deploy.yml -e env=staging"
         working-directory: oms-platform/ansible
+        # HALLAZGO REAL (mismo ya documentado en la Fase 4 local, ver
+        # BITACORA-COMANDOS.md § 4.6/6.14): ansible.cfg tiene
+        # `stdout_callback = yaml`, que dependía de un plugin de
+        # community.general ELIMINADO desde su versión 12.0.0 ("The
+        # 'community.general.yaml' callback plugin has been removed").
+        # En local esto se resolvía pasando ANSIBLE_STDOUT_CALLBACK=default
+        # en la línea de comandos — aquí se declara como env del paso, sin
+        # tocar ansible.cfg (artefacto ya revisado y aceptado).
+        env:
+          ANSIBLE_STDOUT_CALLBACK: default
         run: |
           ansible-playbook playbooks/deploy.yml \
             -e env=staging \
@@ -377,6 +387,10 @@ jobs:
 
       - name: "ansible-playbook deploy.yml -e env=production (canary 10% real, ver group_vars/production.yml)"
         working-directory: oms-platform/ansible
+        # Mismo hallazgo real del callback yaml removido (ver
+        # BITACORA-COMANDOS.md § 6.14) — ansible.cfg no se toca.
+        env:
+          ANSIBLE_STDOUT_CALLBACK: default
         run: |
           ansible-playbook playbooks/deploy.yml \
             -e env=production \

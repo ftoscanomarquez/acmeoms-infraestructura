@@ -2713,3 +2713,20 @@ Origin: .../oms-platform/ansible/playbooks/deploy.yml:123:7
 **Corrección:** se agregó `working-directory: oms-platform/ansible` al paso "Instalar Ansible + colecciones" en ambos jobs (`deploy-staging` y `deploy-production`), y se simplificó la ruta del `requirements.yml` a relativa (`-r requirements.yml`, ya que el `cwd` ahora es el correcto).
 
 **Intento de reproducir el hallazgo de forma aislada localmente**: se intentó simular el escenario (instalar colecciones desde un directorio sin `ansible.cfg`, luego intentar resolver el módulo desde uno con `ansible.cfg` apuntando a un `.collections` vacío) — no se logró reproducir exactamente el fallo en un entorno WSL local, porque ya existían colecciones instaladas de sesiones anteriores en la ubicación por defecto del sistema, contaminando la prueba. Se optó por confiar en la evidencia directa del log real de GitHub Actions (que sí mostró el path exacto de instalación, `~/.ansible/collections/ansible_collections/community/general`, distinto del `collections_path` configurado) en vez de insistir en una reproducción aislada — el fix es correcto independientemente de si se pudo replicar el síntoma exacto en local.
+
+### 6.14 · Cuarto intento — hallazgo YA CONOCIDO reaparece: callback `yaml` removido de `community.general`
+
+Con el `working-directory` corregido, `ansible-galaxy` ya instaló las colecciones en el sitio correcto y `ansible-playbook` arrancó de verdad, pero falló de inmediato:
+
+```
+[ERROR]: The 'community.general.yaml' callback plugin has been removed. The plugin has been
+superseded by the option `result_format=yaml` in callback plugin ansible.builtin.default
+from ansible-core 2.13 onwards. This feature was removed from collection 'community.general'
+version 12.0.0.
+```
+
+**Este es exactamente el mismo hallazgo ya documentado y resuelto en la Fase 4 (§4.6) para las ejecuciones locales** — `ansible.cfg` tiene `stdout_callback = yaml`, que dependía de un plugin de `community.general` eliminado desde su versión 12.0.0. En local se resolvía pasando `ANSIBLE_STDOUT_CALLBACK=default` como variable de entorno antes de cada invocación manual — pero esa variable nunca se trasladó al workflow del pipeline, así que reapareció en el primer intento real de `ansible-playbook` desde GitHub Actions.
+
+**Corrección:** se agregó `env: { ANSIBLE_STDOUT_CALLBACK: default }` al paso `ansible-playbook deploy.yml` en ambos jobs (`deploy-staging` y `deploy-production`), sin tocar `ansible.cfg` (artefacto ya revisado y aceptado, mismo criterio que en local).
+
+**Lección para el checklist de portar comandos locales a CI/CD**: cualquier variable de entorno que se usó manualmente para "arreglar" algo en ejecuciones locales (`ANSIBLE_CONFIG`, `ANSIBLE_STDOUT_CALLBACK`, etc.) debe revisarse explícitamente al automatizar esos mismos comandos en un pipeline — no basta con copiar el comando final, hay que copiar también el entorno que lo rodeaba.
