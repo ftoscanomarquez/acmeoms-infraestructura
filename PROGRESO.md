@@ -118,11 +118,19 @@ Se dio además una explicación pedagógica completa, línea por línea, de todo
 - [ ] `ansible-playbook deploy.yml -e env=production -e image_sha=<mismo SHA que staging>`
 - [ ] Verificar canary al 10% en producción
 
-### Fase 6 — CI/CD (GitHub Actions + WIF)
+### Fase 6 — CI/CD (GitHub Actions + WIF) ✅ COMPLETA
 
-- [ ] Crear `.github/workflows/ci-cd.yml` (build → test → push imagen → captura digest → despliegue vía Ansible/gcloud con WIF)
-- [ ] Push de tag `v1.0.0` al remoto `github`
-- [ ] Verificar que el pipeline corre y el mismo SHA llega a ambos entornos
+- [x] Crear `.github/workflows/ci-cd.yml` (`ci` → `build` con Trivy+Cosign → `deploy-staging` → `deploy-production` con canary 10%, gate manual `environment: production`)
+- [x] Push de tag `v1.0.0` al remoto `github` — pipeline completo verificado de punta a punta tras 9 iteraciones de fixes reales (WIF audience, cosign verify, ansible-galaxy path, callback yaml, terraform binario, permiso bucket tfstate, cosign copy cross-proyecto)
+- [x] Verificar que el pipeline corre y el mismo digest de imagen llega a ambos entornos (`cosign verify` independiente + `curl` real al healthcheck en staging y producción)
+- [x] Endurecido con Trivy real (`trivy config` sobre Terraform + `trivy image` sobre la imagen Docker) — 3 hallazgos de seguridad reales corregidos contra GCP real (SSL de Cloud SQL, `serviceAccountUser` sobre-otorgado, logging de Cloud SQL)
+- [x] SonarCloud cableado pero deliberadamente apagado (`if: vars.SONAR_HOST_URL != ''`), documentado el motivo
+- [x] Segundo workflow `.github/workflows/canary-decision.yml` (decisión manual post-canary: `promote` con `target_percent` 11-100, o `rollback`) + playbook `promote-canary.yml`
+- [x] Repitió el ciclo completo con un build nuevo real (`v1.1.0`, bump `0.2.0`→`0.3.0`) para reverificar todo de punta a punta, tal como pidió el usuario
+- [x] `canary-decision.yml` verificado como ejecución real de GitHub Actions (no solo playbook local) — 2 hallazgos reales nuevos corregidos: `attribute_condition` de WIF no contemplaba `workflow_dispatch`, y `promote-canary.yml` rompía con 3 revisiones activas simultáneas
+- [x] Producción cerrada en estado limpio: canary promovido a 100% real (`oms-production-00017-huk`, `version: 0.3.0`), verificado contra la API de Cloud Run
+
+> **Deuda técnica menor identificada, no bloqueante** (ver `BITACORA-COMANDOS.md` § 6.21 y la conversación de cierre): el fix de `promote-canary.yml` (`head -n1` sobre el `awk` que busca "la otra revisión") resuelve el error de sintaxis de `gcloud` cuando hay más de 2 revisiones activas, pero toma la *primera* que aparece en el listado de `status.traffic[]`, no necesariamente la que tiene más tráfico real entre las "no-canary". En la prueba real esto fue inofensivo (se promovió a 100% igual después), pero si se quisiera usar `promote-canary.yml` con más rigor en un escenario de 3+ revisiones activas, convendría cambiar el criterio a "la de mayor `percent` actual entre las no-canary" en vez de "la primera línea".
 
 ### Fase 7 — Bonus
 
