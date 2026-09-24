@@ -269,6 +269,16 @@ jobs:
       - name: "Configurar gcloud"
         uses: google-github-actions/setup-gcloud@v2
 
+      # HALLAZGO REAL (ver BITACORA-COMANDOS.md § 6.12): `cosign verify`
+      # necesita hacer su propia petición GET al registro para leer el
+      # manifest de la imagen (verificar credenciales aparte de las de
+      # Docker) — sin este paso, fallaba con "DENIED: Unauthenticated
+      # request ... artifactregistry.repositories.downloadArtifacts" aunque
+      # gcloud ya estuviera autenticado. Mismo comando que ya se usa en el
+      # job `build` antes del `docker push`.
+      - name: "Configurar Docker/Cosign contra Artifact Registry"
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
       - name: "Verificar la firma antes de desplegar"
         # Cierra el ciclo de la firma: no basta con firmar, hay que
         # EXIGIR una firma válida antes de desplegar — si alguien

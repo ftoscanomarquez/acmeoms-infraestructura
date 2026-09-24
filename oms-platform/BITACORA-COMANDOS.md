@@ -2679,3 +2679,19 @@ oidc {
 Verificado con `terraform plan`: `update in-place` (no recrea el pool ni el provider). Aplicado contra staging y producción reales; verificado con `curl` que ambos servicios de Cloud Run siguen respondiendo `200 {"status":"ok","version":"0.2.0"}` tras el cambio (el WIF provider no afecta a Cloud Run directamente, pero se confirmó por rigor).
 
 **Lección real para documentar en el video**: un comentario en el código que "suena razonado" (cita una fuente, explica un porqué) no sustituye la verificación contra el comportamiento real de la herramienta — la nota original sonaba convincente, pero solo se pudo confirmar que era errónea ejecutando el pipeline real contra GCP, no leyendo documentación por separado. Es exactamente el tipo de descubrimiento que solo aparece en la práctica.
+
+### 6.12 · Segundo intento del tag — hallazgo real: `cosign verify` necesita su propia autenticación Docker
+
+Se recreó el tag apuntando al commit con el fix del audience (`git tag -d v1.0.0 && git push github :refs/tags/v1.0.0 && git tag v1.0.0 && git push github v1.0.0` — recrear un tag existente requiere borrarlo primero, `git` no permite moverlo con un push normal). Esta vez `ci`, `build` (con Trivy + Cosign sign) y la autenticación de `deploy-staging` pasaron correctamente, pero falló el paso `cosign verify` con:
+
+```
+Error: GET https://europe-west3-docker.pkg.dev/v2/token?scope=...: DENIED: Unauthenticated request.
+Unauthenticated requests do not have permission "artifactregistry.repositories.downloadArtifacts"
+on resource "projects/acmeoms-staging-fatm/locations/europe-west3/repositories/oms"
+```
+
+**Causa:** `cosign verify` hace su propia petición HTTP al registro para leer el manifest de la imagen y su firma adjunta — no reutiliza automáticamente ninguna sesión de `gcloud`. En el job `build`, el `cosign sign` funcionó porque el paso anterior (`docker push`) ya había ejecutado `gcloud auth configure-docker`, dejando escritas las credenciales en `~/.docker/config.json`, que Cosign sí reutiliza. Pero en `deploy-staging`, el flujo era `auth` → `setup-gcloud` → `cosign verify` directamente — **sin** el paso `gcloud auth configure-docker` intermedio, así que Cosign intentaba la petición sin ninguna credencial.
+
+**Corrección:** se agregó `gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet` entre `setup-gcloud` y `cosign verify` en el job `deploy-staging` — mismo comando ya usado en `build`. Se revisó también `deploy-production`: ese job ya tenía el `configure-docker` correcto antes de su propio `cosign verify` (viene después del `docker push` de producción), así que no necesitó el mismo fix.
+
+**Patrón general para recordar**: cualquier paso que use `cosign` (`sign` o `verify`) contra una imagen en un registro privado necesita que el paso `gcloud auth configure-docker` ya se haya ejecutado ANTES en ese mismo job — Cosign no hereda la autenticación de `google-github-actions/auth` directamente, solo a través de las credenciales de Docker que ese comando escribe.
