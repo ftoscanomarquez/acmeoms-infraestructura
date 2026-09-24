@@ -2967,3 +2967,18 @@ curl -H "Authorization: Bearer $(gcloud auth application-default print-access-to
 ```
 
 ✅ **`canary-decision.yml` verificado end-to-end como workflow real de GitHub Actions**, no solo como playbook local: run exitoso final `36013855248`, tras dos rondas de fixes reales (WIF + Ansible), cada uno con causa raíz confirmada y corrección verificada contra la API real de GCP.
+
+**Cierre real del ciclo**: inmediatamente después, el usuario disparó un segundo `canary-decision.yml` (`decision=promote`, `target_percent=100`, run `36013855248`→`36014615757`) para dejar producción en un estado final limpio en vez de a medias 50/50. Verificado:
+
+```bash
+curl -H "Authorization: Bearer $(gcloud auth application-default print-access-token)" \
+  "https://run.googleapis.com/v2/projects/acmeoms-production-fatm/locations/europe-west3/services/oms-production" \
+  | grep -E 'revision|percent'
+# → oms-production-00017-huk   percent: 100   (única con tráfico real)
+# → oms-production-00003-yod, oms-production-00008-qeb: listadas, sin tráfico
+
+curl https://oms-production-982350171486.europe-west3.run.app/health
+# → {"status":"ok","version":"0.3.0"}
+```
+
+Producción queda así en el estado deseado tras todo el ciclo de pruebas de la Fase 6: una sola revisión oficial (`0.3.0`), dos revisiones anteriores conservadas en el historial sin recibir tráfico (comportamiento nativo de Cloud Run, no requieren limpieza para que el servicio esté sano — ver la pregunta del usuario sobre por qué una revisión al 0% no se marca "no elegible": sigue existiendo y saludable, solo sin tráfico asignado, precisamente para permitir un rollback instantáneo sin rebuild si hiciera falta).
