@@ -2730,3 +2730,17 @@ version 12.0.0.
 **Corrección:** se agregó `env: { ANSIBLE_STDOUT_CALLBACK: default }` al paso `ansible-playbook deploy.yml` en ambos jobs (`deploy-staging` y `deploy-production`), sin tocar `ansible.cfg` (artefacto ya revisado y aceptado, mismo criterio que en local).
 
 **Lección para el checklist de portar comandos locales a CI/CD**: cualquier variable de entorno que se usó manualmente para "arreglar" algo en ejecuciones locales (`ANSIBLE_CONFIG`, `ANSIBLE_STDOUT_CALLBACK`, etc.) debe revisarse explícitamente al automatizar esos mismos comandos en un pipeline — no basta con copiar el comando final, hay que copiar también el entorno que lo rodeaba.
+
+### 6.15 · Quinto intento — hallazgo real: falta el binario `terraform` en los jobs de despliegue
+
+Con el callback corregido, `ansible-playbook` arrancó de verdad y avanzó hasta la propia lógica del playbook, pasando `Validar parámetros obligatorios`, pero falló en el siguiente pre_task (el de la Fase 5, que lee `cpu`/`memory`/instancias desde `terraform output`):
+
+```
+[ERROR]: Task failed: Module failed: Error executing command: [Errno 2] No such file or directory: b'terraform'
+```
+
+**Causa:** cada job de GitHub Actions corre en una máquina virtual completamente nueva y vacía — el job `ci` sí instala Terraform explícitamente con `hashicorp/setup-terraform@v3` (para `terraform fmt`/`validate`), pero esa instalación no persiste hacia `deploy-staging` ni `deploy-production`, que son máquinas distintas. El pre_task de `deploy.yml` (agregado en la Fase 5 para leer `terraform output -json` como fuente de verdad de la capacidad de Cloud Run) nunca se probó antes en un entorno sin Terraform ya instalado de antemano — en local, WSL siempre lo tenía disponible desde la Fase 1.
+
+**Corrección:** se agregó `uses: hashicorp/setup-terraform@v3` en ambos jobs de despliegue, antes de la autenticación WIF en `deploy-staging` (donde se ejecuta justo después de `google-github-actions/auth`) y justo después del checkout en `deploy-production` (no depende de ninguna credencial GCP, solo instala el binario).
+
+**Patrón que se repite en esta fase**: cada uno de los hallazgos 6.11 a 6.15 es la misma categoría de error — algo que en local "simplemente funcionaba" porque el entorno de la sesión de trabajo ya tenía preinstalado o preconfigurado lo necesario (Terraform, las colecciones de Ansible, el `ANSIBLE_CONFIG`, la variable de audience correcta), pero que nunca se verificó explícitamente contra una máquina limpia hasta ejecutar el pipeline real. Confirma en la práctica por qué "funciona en mi máquina" no es suficiente para CI/CD — cada job es, literalmente, una máquina que nunca ha visto nada de esto antes.

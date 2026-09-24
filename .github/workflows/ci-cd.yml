@@ -269,6 +269,14 @@ jobs:
       - name: "Configurar gcloud"
         uses: google-github-actions/setup-gcloud@v2
 
+      # HALLAZGO REAL (ver BITACORA-COMANDOS.md § 6.15): el pre_task de
+      # deploy.yml (Fase 5) ejecuta `terraform init`/`terraform output` para
+      # leer cpu/memory/instancias como fuente de verdad — el binario
+      # `terraform` no viene preinstalado en el runner y nunca se agregó
+      # aquí (sí estaba en el job `ci`, pero cada job es una máquina nueva).
+      - name: "Instalar Terraform"
+        uses: hashicorp/setup-terraform@v3
+
       # HALLAZGO REAL (ver BITACORA-COMANDOS.md § 6.12): `cosign verify`
       # necesita hacer su propia petición GET al registro para leer el
       # manifest de la imagen (verificar credenciales aparte de las de
@@ -338,6 +346,11 @@ jobs:
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
+
+      # Mismo hallazgo real que en deploy-staging (ver BITACORA-COMANDOS.md
+      # § 6.15): el pre_task de deploy.yml necesita el binario `terraform`.
+      - name: "Instalar Terraform"
+        uses: hashicorp/setup-terraform@v3
 
       # Promocionar = copiar el MISMO digest al registro de producción,
       # NUNCA reconstruir — así se garantiza la regla innegociable del
