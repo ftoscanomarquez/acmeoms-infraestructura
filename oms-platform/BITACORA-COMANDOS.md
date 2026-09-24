@@ -2771,3 +2771,29 @@ resource "google_storage_bucket_iam_member" "cicd_tfstate_reader" {
 Verificado con `terraform plan`: `1 to add, 0 to change, 0 to destroy` en ambos entornos (recurso nuevo y aislado, sin tocar nada existente). Aplicado contra staging y producción reales.
 
 **Reflexión para el video**: este hallazgo es cualitativamente distinto a los 5 anteriores — no fue un olvido de "copiar el paso al pipeline", sino una consecuencia directa y correcta del diseño de mínimo privilegio: el SA de CI/CD *nunca debió* tener permisos que no usa, así que cuando una nueva funcionalidad (leer `terraform output`) necesitó un permiso nuevo, el sistema correctamente lo rechazó hasta que se otorgó explícitamente — el fallo de IAM funcionó exactamente como debía, obligando a una decisión consciente en vez de un acceso implícito.
+
+### 6.17 · Séptimo intento — el usuario aprobó el gate manual por primera vez, y apareció el último hallazgo real
+
+Con los 6 hallazgos anteriores corregidos, `deploy-staging` pasó **completo** por primera vez (ver la verificación externa: `curl` contra staging respondió `200 {"status":"ok","version":"0.2.0"}`). `deploy-production` quedó en `status: waiting`, confirmando que el gate manual (`environment: production`, Required reviewers) funcionaba exactamente como se diseñó. El usuario aprobó manualmente en la UI de GitHub por primera vez en este proyecto.
+
+El job avanzó correctamente por la autenticación dual, el `docker pull`/`tag`/`push` de promoción, pero falló en la verificación de la firma:
+
+```
+Error: no signatures found
+```
+
+**Causa:** la firma de Cosign es un artefacto OCI *adjunto al registro donde se creó* (staging), no algo que viaje automáticamente al copiar la imagen a otro registro con `docker tag`+`push`. El digest de la imagen es idéntico en ambos registros (ya verificado en fases anteriores), pero la firma —que vive como un objeto separado, con un nombre derivado del digest, en el propio Artifact Registry de staging— nunca se copió a producción.
+
+**Investigación antes de aplicar el fix**: se verificó con `gh api` el código fuente real de `cosign copy` en GitHub, confirmando dos cosas: (1) el comando existe y hace justo lo necesario (`cosign copy <src> <dst>` copia imagen + firmas; con `--only=sig`, solo la firma); (2) en versiones recientes de Cosign (v3+) el comando aparece marcado `Deprecated` en favor de `oras copy -r` — pero se confirmó explícitamente que en `v2.5.2` (la versión ya fijada en todo este pipeline vía `cosign-installer@v3` con `cosign-release: v2.5.2`) el comando **no** estaba deprecado, así que es seguro usarlo aquí sin inconsistencia de versiones.
+
+**Decisión de diseño (confirmada con el usuario, entre 2 alternativas):** usar `cosign copy --only=sig` para preservar la firma ORIGINAL creada en el job `build` (mismo certificado, mismo timestamp), en vez de volver a firmar la imagen ya en producción con un segundo `cosign sign` — evita tener dos firmas distintas para el mismo digest, más fiel al concepto de "una imagen, una firma, que viaja con ella".
+
+```yaml
+- name: "Copiar la firma original al registro de producción"
+  run: |
+    cosign copy --only=sig \
+      "${{ needs.build.outputs.full_image_staging }}" \
+      "${{ env.REGION }}-docker.pkg.dev/${{ vars.PRODUCTION_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image_sha }}"
+```
+
+Insertado entre "Promocionar la imagen" y "Verificar la firma en el registro de producción" (que se mantiene sin cambios, ahora sí encontrará la firma).

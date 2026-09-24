@@ -381,9 +381,27 @@ jobs:
           docker tag "${{ needs.build.outputs.full_image_staging }}" "$PROD_IMAGE"
           docker push "$PROD_IMAGE"
 
-      - name: "Verificar la firma en el registro de producción"
+      # HALLAZGO REAL (ver BITACORA-COMANDOS.md § 6.17): la firma de Cosign
+      # es un artefacto OCI adjunto al REGISTRO donde se creó (staging), no
+      # algo que viaje automáticamente con un `docker tag`+`push` a otro
+      # registro. Sin este paso, `cosign verify` fallaba con
+      # "Error: no signatures found" contra producción, aunque la imagen
+      # (mismo digest exacto) sí tuviera una firma válida en staging.
+      # `cosign copy --only=sig` copia SOLO la firma (la imagen ya se copió
+      # arriba con docker), preservando el certificado y timestamp
+      # ORIGINALES de cuando se firmó en el job `build` — una imagen, una
+      # firma, que ahora también existe en el registro de producción.
+      - name: "Instalar Cosign"
         uses: sigstore/cosign-installer@v3
-      - run: |
+
+      - name: "Copiar la firma original al registro de producción"
+        run: |
+          cosign copy --only=sig \
+            "${{ needs.build.outputs.full_image_staging }}" \
+            "${{ env.REGION }}-docker.pkg.dev/${{ vars.PRODUCTION_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image_sha }}"
+
+      - name: "Verificar la firma en el registro de producción"
+        run: |
           cosign verify \
             --certificate-identity-regexp="^https://github.com/${{ github.repository }}/.github/workflows/ci-cd.yml@.*$" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
