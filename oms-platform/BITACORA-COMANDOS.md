@@ -2645,3 +2645,37 @@ Unable to resolve action `aquasecurity/trivy-action@0.28.0`, unable to find vers
 Se aprovechó también para verificar contra el `action.yaml` real del repositorio (`gh api repos/aquasecurity/trivy-action/contents/action.yaml`) que los inputs usados (`scan-type`, `scan-ref`, `image-ref`, `severity`, `exit-code`, `trivyignores`) existen tal cual en esa acción — ninguno estaba mal escrito, solo la referencia de versión.
 
 **Lección:** al referenciar una acción de terceros por primera vez, verificar el tag real con `gh api repos/<owner>/<repo>/tags` (o revisando el repositorio directamente) en vez de asumir un número de versión de memoria — un error de un solo carácter (`v` faltante) hace fallar el job antes de ejecutar ningún paso real, sin relación aparente con el contenido de la configuración.
+
+### 6.11 · Primer disparo real del tag `v1.0.0` — hallazgo real en el WIF provider (audience incorrecto)
+
+Con el job `ci` ya sano, se creó y empujó el primer tag real:
+
+```bash
+git tag v1.0.0
+git push github v1.0.0
+```
+
+El job `build` falló en el paso de autenticación WIF:
+
+```
+google-github-actions/auth failed with: failed to generate Google Cloud federated token for
+//iam.googleapis.com/.../workloadIdentityPools/github-pool-staging/providers/github-provider:
+{"error":"invalid_grant","error_description":"The audience in ID Token [...] does not match
+the expected audience."}
+```
+
+**Causa raíz — una decisión de diseño de la Fase 2 resultó incorrecta en la práctica.** El módulo `iam` tenía `allowed_audiences = ["sts.amazonaws.com"]` en el WIF provider, con un comentario que afirmaba que ese era "el audience por defecto de GitHub Actions, que funciona igual para cualquier proveedor receptor". **Verificado como incorrecto al ejecutar el pipeline real**: la acción oficial `google-github-actions/auth@v2` genera el token OIDC con audience = la URL completa del propio provider (`https://iam.googleapis.com/projects/.../providers/github-provider`), no `sts.amazonaws.com`. Con esa restricción configurada, GCP rechazaba cualquier token real que la acción oficial generase — el pipeline nunca podría haber funcionado con esa configuración, sin importar cuántas veces se reintentara.
+
+**Corrección:** se eliminó `allowed_audiences` del bloque `oidc {}` por completo. Al omitirlo, Google usa su propio valor por defecto (la URL del provider), que es exactamente lo que `google-github-actions/auth@v2` ya genera — coincide sin necesidad de declarar nada manualmente.
+
+```hcl
+oidc {
+  issuer_uri = "https://token.actions.githubusercontent.com"
+  # (sin allowed_audiences — usa el default de Google, que coincide con
+  # lo que google-github-actions/auth@v2 genera)
+}
+```
+
+Verificado con `terraform plan`: `update in-place` (no recrea el pool ni el provider). Aplicado contra staging y producción reales; verificado con `curl` que ambos servicios de Cloud Run siguen respondiendo `200 {"status":"ok","version":"0.2.0"}` tras el cambio (el WIF provider no afecta a Cloud Run directamente, pero se confirmó por rigor).
+
+**Lección real para documentar en el video**: un comentario en el código que "suena razonado" (cita una fuente, explica un porqué) no sustituye la verificación contra el comportamiento real de la herramienta — la nota original sonaba convincente, pero solo se pudo confirmar que era errónea ejecutando el pipeline real contra GCP, no leyendo documentación por separado. Es exactamente el tipo de descubrimiento que solo aparece en la práctica.

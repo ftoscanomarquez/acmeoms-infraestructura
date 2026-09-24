@@ -21,16 +21,24 @@ resource "google_iam_workload_identity_pool_provider" "github" {
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
-    # NOTA ACLARATORIA (agregado por el equipo, no es un error ni un
-    # residuo de copiar/pegar): "sts.amazonaws.com" es el "audience" (el
-    # destinatario declarado) por defecto que GitHub Actions incluye en
-    # sus tokens OIDC cuando no se especifica uno distinto — un valor
-    # histórico de GitHub (su primer caso de uso documentado fue con AWS),
-    # pero funciona igual para cualquier proveedor receptor, incluido GCP,
-    # siempre que ese proveedor lo declare como audiencia aceptada — que es
-    # justo lo que hace esta línea. Confirmado con la documentación oficial
-    # de Google para WIF + GitHub Actions.
-    allowed_audiences = ["sts.amazonaws.com"]
+    # HALLAZGO REAL (Fase 6, ver BITACORA-COMANDOS.md § 6.11): la nota
+    # anterior en este bloque afirmaba que "sts.amazonaws.com" era el
+    # audience por defecto de GitHub Actions y que funcionaba igual para
+    # cualquier proveedor receptor — INCORRECTO en la práctica. La acción
+    # oficial `google-github-actions/auth@v2` NO usa ese audience: genera
+    # el token OIDC con audience = la URL COMPLETA de este mismo provider
+    # (`https://iam.googleapis.com/projects/.../providers/github-provider`).
+    # Con `allowed_audiences = ["sts.amazonaws.com"]` configurado, GCP
+    # rechazaba la autenticación real con:
+    #   "invalid_grant: The audience in ID Token [...] does not match
+    #    the expected audience."
+    # Se elimina `allowed_audiences` por completo: al omitirlo, Google usa
+    # su propio default (la URL del provider), que es exactamente lo que
+    # `google-github-actions/auth@v2` ya genera — sin necesidad de declarar
+    # nada manualmente. "sts.amazonaws.com" es un valor real, pero solo
+    # aplica cuando el cliente que arma el token lo pide explícitamente
+    # (algunos ejemplos antiguos de terceros lo hacían); la acción oficial
+    # de Google no lo hace.
   }
 
   attribute_mapping = {
