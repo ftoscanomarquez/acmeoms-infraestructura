@@ -47,7 +47,12 @@ cloud_run_memory        = "2Gi" # sin cambios; ya estaba en el límite razonable
 image_repo = "europe-west3-docker.pkg.dev/acmeoms-production-fatm/oms/oms"
 image_sha  = "sha256:d68ca4fc59a42a8f6bb74e9f82d937f545315230c7bc214880d1310907c62f72"
 
-deletion_protection = true # innegociable
+# CIERRE DEL PROYECTO (terraform destroy real, tras grabar el video —
+# decisión ya tomada desde el inicio del trabajo, para no seguir
+# gastando el crédito de $300/90 días). "innegociable" mientras el
+# entorno estuvo vivo y sirviendo tráfico real; aquí se baja de forma
+# definitiva porque el propio entorno se destruye por completo.
+deletion_protection = false # ⚠️ DEFINITIVO — cierre del proyecto, el entorno completo se destruye
 
 github_repository = "ftoscanomarquez/acmeoms-infraestructura"
 

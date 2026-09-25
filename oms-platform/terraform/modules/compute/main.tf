@@ -501,8 +501,11 @@ resource "google_storage_bucket" "spa_assets" {
 
   labels = var.labels
 
+  # Bajado a `false` para el cierre del proyecto (terraform destroy real
+  # de todo el trabajo) — ver la misma decisión, con el mismo motivo, en
+  # modules/database/main.tf.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 

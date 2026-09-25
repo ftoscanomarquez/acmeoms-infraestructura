@@ -24,15 +24,11 @@ cloud_run_memory        = "2Gi"   # debe coincidir con ansible/group_vars/stagin
 image_repo = "europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms"
 image_sha  = "sha256:d68ca4fc59a42a8f6bb74e9f82d937f545315230c7bc214880d1310907c62f72"
 
-# HALLAZGO REAL (Fase 7, verificación bonus CMEK): igual que
-# prevent_destroy (ver modules/database/main.tf), deletion_protection es
-# una SEGUNDA capa de defensa independiente contra el mismo tipo de
-# accidente — bajarla sin más habría sido un error de diseño (redundancia
-# real, no un descuido). GCP la exigió bajar también para poder recrear
-# la instancia con encryption_key_name (campo inmutable) — la recreación
-# ya se aplicó con éxito (CMEK real activo, verificado contra la API).
-# Restaurada a `true` de forma permanente.
-deletion_protection = true # también en staging
+# CIERRE DEL PROYECTO (terraform destroy real de ambos entornos, tras
+# grabar el video — decisión ya tomada desde el inicio del trabajo): se
+# baja de forma definitiva para permitir la destrucción real de Cloud
+# SQL. Ver el mismo motivo, con más detalle, en modules/database/main.tf.
+deletion_protection = false # ⚠️ DEFINITIVO — cierre del proyecto, el entorno completo se destruye
 
 github_repository = "ftoscanomarquez/acmeoms-infraestructura"
 

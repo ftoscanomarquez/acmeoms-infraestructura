@@ -28,3 +28,12 @@ override.tf.json
 # ── Python (usado por el plugin de inventario dinámico de Ansible) ──
 __pycache__/
 *.pyc
+
+# ── Grabaciones locales (video de explicación del trabajo, etc.) ────
+# Archivos de video generados localmente durante la grabación del video
+# de entrega — nunca pertenecen al repositorio de código (tamaño real:
+# varios GB), se comparten por separado (ej. subida directa a la
+# plataforma de entrega o a un enlace externo).
+*.mp4
+*.mkv
+*.mov

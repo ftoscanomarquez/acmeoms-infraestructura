@@ -214,18 +214,16 @@ resource "google_sql_database_instance" "main" {
     #   "Error: Instance cannot be destroyed ... has lifecycle.prevent_destroy
     #    set, but the plan calls for this resource to be destroyed."
     # Comportamiento CORRECTO de la protección — no es un bug a silenciar
-    # sin más. Este módulo es compartido por staging Y producción: se baja
-    # temporalmente cada vez que hace falta recrear la instancia de UN
-    # entorno concreto (primero staging, ahora producción, ambas
-    # recreaciones conscientes, sin datos reales de negocio en juego), y
-    # se restaura a `true` de forma permanente en cuanto ese entorno
-    # concreto termina su `apply` — el campo `lifecycle` no forma parte
-    # del estado remoto del recurso, así que alternarlo no es destructivo
-    # ni fuerza cambios en la instancia ya creada.
-    # Restaurada a `true` de forma permanente tras completar la
-    # recreación consciente en AMBOS entornos (staging y producción), con
-    # CMEK real ya activo y verificado contra la API en los dos.
-    prevent_destroy = true
+    # sin más. Se bajó y restauró dos veces durante la Fase 7 (staging y
+    # producción, ambas recreaciones conscientes con CMEK).
+    #
+    # Bajada de nuevo, esta vez de forma DEFINITIVA, para el cierre real
+    # del proyecto (`terraform destroy` de ambos entornos completos, tras
+    # grabar el video de explicación — decisión ya tomada por el usuario
+    # desde el inicio, para no seguir gastando el crédito de $300/90 días).
+    # No hay ninguna razón para restaurarla después de esto: el propio
+    # entorno deja de existir.
+    prevent_destroy = false
   }
 
   # NOTA DE DISEÑO (agregado por el equipo, hallazgo real durante el primer

@@ -6,9 +6,9 @@
 
 ---
 
-## 🏁 AVANCE TOTAL DEL TRABAJO — **~97% completo**
+## 🏁 AVANCE TOTAL DEL TRABAJO — **~98% completo**
 
-**Rúbrica base (100 pts): ✅ completa y verificada contra GCP real · Bonus: 3/5 completos (+15 pts), 2/5 sin empezar**
+**Rúbrica base (100 pts): ✅ completa y verificada contra GCP real · Bonus: 3/5 completos (+15 pts), 2/5 sin empezar · Cierre (destroy): 🟡 95% — casi terminado**
 
 | Fase | Estado | % |
 |---|---|---|
@@ -21,14 +21,15 @@
 | Fase 6 — CI/CD (GitHub Actions + WIF) | ✅ COMPLETA | 100% |
 | Fase 7 — Bonus (3 de 5 opcionales) | 🟡 PARCIAL | 60% (3/5) |
 | Fase 8 — Documentación final | ✅ COMPLETA | 100% |
+| Fase 9 — Cierre (`terraform destroy`) | 🟡 CASI TERMINADO | ~95% |
 
-**Lo único que queda pendiente del proyecto**: los 2 bonus restantes de la Fase 7 (Multi-region DR, Bastion+Ansible+Datadog — mayor esfuerzo real, no se abordaron por decisión explícita de priorizar los 3 más simples), y el `terraform destroy` final de ambos entornos (decisión ya tomada por el usuario, se hará después de grabar el video de explicación).
+> ⚠️ **PUNTO DE RETOMADA INMEDIATO** (si se corta la sesión, empezar aquí): se disparó `terraform destroy` en ambos entornos. **Todo lo que genera costo real (Cloud SQL, Redis, Cloud Run, Load Balancer, KMS, VPC connectors) ya está destruido, verificado contra la API real, en staging Y producción.** Queda pendiente únicamente el último recurso de red (VPC + peering + IP reservada) en ambos, bloqueado por un hallazgo real: los backups automáticos de Cloud SQL sobreviven a la instancia borrada y retienen un proyecto de tenant interno de Google que usa la conexión de peering — se resuelve solo con tiempo (horas). **Sin ningún riesgo de coste relevante mientras tanto.** Ver detalle completo y comandos exactos para reintentar en `BITACORA-COMANDOS.md` § 9.5.
 
 ---
 
 ## 📍 Estado actual
 
-**Fase en curso:** ✅ **Proyecto prácticamente cerrado.** Fases 0-6 y 8 completas. Fase 7 (bonus) con 3 de 5 completos (expand-and-contract, Cloud CDN, CMEK — ver detalle abajo). `terraform plan` confirma "No changes" en producción tras el cierre de todo el trabajo de infraestructura. Queda pendiente solo: grabar el video de explicación (el usuario lo hará ahora) y, después, el `terraform destroy` final de ambos entornos.
+**Fase en curso:** ✅ **Fase 9 — cierre real (`terraform destroy`), casi terminado.** El usuario grabó el video de explicación y se disparó el destroy de ambos entornos. Todo lo que genera costo real (Cloud SQL, Redis, Cloud Run, Load Balancer, KMS, VPC connectors) ya está destruido y verificado en staging y producción. Falta solo el último recurso de red (VPC + peering + IP reservada) en ambos, bloqueado por un hallazgo real de GCP (ver `BITACORA-COMANDOS.md` § 9.3-9.5) — se resuelve solo con tiempo, sin ningún riesgo de coste mientras tanto. Sesión pausada por batería; retomar mañana con los comandos exactos documentados en § 9.5.
 
 **Último hito completado:** El pipeline `ci-cd.yml` corrió de punta a punta (`ci` → `build` con Trivy+Cosign → `deploy-staging` → aprobación manual → `deploy-production`) tras 9 iteraciones de fixes reales, todos documentados en `BITACORA-COMANDOS.md` secciones 6.11–6.19. Verificado con `curl` real al healthcheck y `cosign verify` independiente de la firma en ambos registros (staging y producción).
 

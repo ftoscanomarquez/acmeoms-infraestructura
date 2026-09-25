@@ -43,8 +43,19 @@ resource "google_kms_crypto_key" "cloudsql" {
   key_ring        = google_kms_key_ring.oms.id
   rotation_period = "7776000s" # 90 días, en segundos (KMS exige el campo en segundos, no días)
 
+  # HALLAZGO REAL (cierre del proyecto — terraform destroy): Cloud KMS no
+  # permite borrar NUNCA el recurso CryptoKey en sí, sea cual sea la
+  # herramienta usada — es una limitación real y documentada de la propia
+  # API de Google, no de Terraform. Solo se puede programar la
+  # destrucción de sus VERSIONES (con un período de gracia mínimo de 24h),
+  # dejando el CryptoKey como un contenedor vacío para siempre en la
+  # consola de GCP, sin coste real relevante (KMS cobra por operaciones y
+  # por rotación activa de versiones, no por la existencia del recurso).
+  # prevent_destroy se baja aquí SOLO para permitir que `terraform destroy`
+  # quite el recurso de su propio estado — no implica que la clave
+  # desaparezca físicamente de GCP.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 
@@ -60,8 +71,10 @@ resource "google_kms_crypto_key" "storage" {
   key_ring        = google_kms_key_ring.oms.id
   rotation_period = "7776000s"
 
+  # Mismo motivo y misma limitación real que en la clave de Cloud SQL de
+  # arriba — ver ese comentario para el detalle completo.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 

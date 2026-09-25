@@ -3088,3 +3088,79 @@ curl https://oms-staging-.../health
 ```
 
 Ambas protecciones (`prevent_destroy` en el código, `deletion_protection` en `staging.tfvars`) restauradas a `true` de forma permanente al finalizar, documentado el motivo temporal de cada bajada directamente en el código donde ocurrió — no queda ningún rastro de "protección desactivada" fuera de los comentarios que explican por qué se bajó y por qué se restauró.
+
+## Fase 9 — Cierre del proyecto: `terraform destroy`
+
+Decisión ya tomada por el usuario desde el inicio del trabajo: destruir toda la infraestructura real tras grabar el video de explicación, para no seguir gastando el crédito de $300/90 días.
+
+### 9.1 · Protecciones bajadas para permitir la destrucción
+
+Las mismas 2 protecciones ya conocidas de la Fase 7 (`prevent_destroy` en `modules/database/main.tf`, `deletion_protection`/`deletion_protection_enabled` en ambos `.tfvars`) se bajaron de nuevo, esta vez de forma **definitiva** (sin restaurarlas después — el entorno completo deja de existir). Además, se identificaron y bajaron **2 protecciones nuevas** no tocadas hasta ahora:
+
+- `lifecycle.prevent_destroy = true` en `google_kms_crypto_key.cloudsql` y `.storage` (`modules/kms/main.tf`).
+- `lifecycle.prevent_destroy = true` en `google_storage_bucket.spa_assets` (`modules/compute/main.tf`, agregado en el bonus de CDN).
+
+**Hallazgo real documentado antes de aplicar**: Cloud KMS no permite borrar nunca el recurso `CryptoKey` en sí — es una limitación real de la propia API de Google, no de Terraform. Solo se puede programar la destrucción de sus *versiones* (con un período de gracia mínimo de 24h); el `CryptoKey` como contenedor queda huérfano para siempre en la consola de GCP, sin coste real relevante (KMS cobra por operaciones y rotación activa, no por la existencia del recurso). Se procedió igual con el `destroy` completo — es la única opción real posible.
+
+### 9.2 · `terraform apply` (no destroy) para consolidar el cambio de protección antes de destruir
+
+Mismo patrón ya aprendido en la Fase 7 (§ 7.3, hallazgo real 3): cambiar `deletion_protection` y forzar la destrucción de Cloud SQL en el MISMO plan no es fiable. Se corrió primero un `apply` normal (`terraform apply -var-file=envs/<env>.tfvars`, sin `-destroy`) para que Terraform consolidara `deletion_protection=false` en el estado real de cada entorno, confirmado con `Plan: 0 to add, 1 to change, 0 to destroy`, antes de pasar a `terraform destroy` en cada uno.
+
+### 9.3 · Destroy real de staging — mayormente exitoso, con un hallazgo real de propagación de GCP
+
+`terraform destroy -var-file=envs/staging.tfvars` contra `acmeoms-staging-fatm`. La inmensa mayoría de los recursos se destruyeron con éxito en la primera pasada: IAM/WIF completo, Load Balancer completo (forwarding rule, proxy HTTPS, certificado, URL map, backend service, NEG), Cloud Run, bucket de assets, Artifact Registry, Secret Manager, KMS (keyring + 2 claves + Service Identities), VPC Access Connector, Cloud SQL (`Destruction complete after 1m36s`), Redis (`Destruction complete after 3m43s`), y las 3 reglas de firewall + subredes.
+
+**Hallazgo real**: el último recurso, `google_service_networking_connection.private_vpc_connection` (la conexión de peering de red privada creada en la Fase 1), falló repetidamente con:
+```
+Error: Unable to remove Service Networking Connection, err: Error waiting for Delete Service Networking Connection:
+Error code 9, message: Failed to delete connection; Producer services (e.g. CloudSQL, Cloud Memstore, etc.)
+are still using this connection.
+```
+Verificado exhaustivamente que esto es un falso positivo de propagación asíncrona, no un recurso real pendiente: `gcloud sql instances list`, `gcloud redis instances list`, `gcloud compute instances list` y `gcloud filestore instances list` contra `acmeoms-staging-fatm` devuelven **0 resultados** en todos los casos — nada real sigue usando la conexión. Reintentado 2 veces más (con 5 y 15 minutos de espera entre intentos), sin éxito.
+
+**Causa real más probable, identificada al reproducir el mismo error en producción con más detalle** (ver § 9.4): Cloud SQL retiene **backups automáticos** incluso después de que la instancia visible se borra (según la política de retención configurada — `retained_backups = 14` en `modules/database/main.tf`), y esos backups huérfanos mantienen vivo, internamente, el proyecto de tenant de Google que la conexión de peering usa. No hay ningún comando de `gcloud`/API que permita listar o borrar esos backups una vez que la instancia padre ya no existe (`gcloud sql backups list`/`gcloud sql operations list` devuelven 403/"instance not found"). Es un caso conocido y documentado en la comunidad de GCP: la limpieza de esos backups huérfanos ocurre de forma automática, pero puede tardar varias horas.
+
+### 9.4 · Destroy real de producción — mismo patrón exacto, con un dato adicional real de la API
+
+`terraform destroy -var-file=envs/production.tfvars` contra `acmeoms-production-fatm`. Mismo resultado: todo destruido con éxito salvo la conexión de peering, con el mismo error exacto.
+
+Se intentó un diagnóstico más profundo, borrando el peering directamente por `gcloud` (no vía Terraform) para obtener más detalle del error real:
+```bash
+gcloud services vpc-peerings delete --network=oms-production-vpc --project=acmeoms-production-fatm --service=servicenetworking.googleapis.com
+```
+La respuesta real incluyó información adicional que el error de Terraform no mostraba:
+```
+reason: 'FLOW_SN_DC_RESOURCE_PREVENTING_DELETE_CONNECTION'
+domain: 'servicenetworking.googleapis.com'
+violations: [{ type: 'googleapis.com', subject: '171113' }]
+```
+`subject: '171113'` es un identificador de proyecto interno de Google (no de `acmeoms-production-fatm` ni `acmeoms-staging-fatm`) — consistente con la hipótesis de un proyecto de tenant interno gestionado por el propio servicio de Cloud SQL, aún vivo por los backups huérfanos, no con ningún recurso real de este proyecto.
+
+**Hallazgo operativo durante el diagnóstico**: en un momento de la sesión, se corrió `terraform destroy -var-file=envs/production.tfvars` sin haber corrido antes `terraform init -reconfigure -backend-config=envs/production.backend.hcl` en esa misma terminal — el backend local seguía apuntando al estado remoto de **staging** de una verificación anterior. El log de `destroy` resultante mostró IDs de recursos de `acmeoms-staging-fatm` a pesar de haber pasado `production.tfvars`. **No causó ningún daño real** (los recursos en cuestión ya estaban destruidos en staging de todas formas, y Terraform siempre opera contra el backend actualmente configurado, nunca "mezcla" el `.tfvars` de un entorno con el estado de otro de forma dañina — simplemente reevalúa ese mismo estado con variables que no le pertenecen, lo cual es inofensivo pero confuso). Lección operativa reforzada: **siempre correr `terraform init -reconfigure -backend-config=...` inmediatamente antes de cualquier `plan`/`apply`/`destroy`**, nunca asumir que el backend de la sesión anterior sigue siendo el correcto.
+
+### 9.5 · Estado real al cierre de la sesión (pendiente de retomar)
+
+Verificado independientemente contra la API real de GCP (no solo el estado de Terraform), en ambos proyectos:
+
+| Recurso | Staging | Producción |
+|---|---|---|
+| Cloud SQL | ✅ Destruido | ✅ Destruido |
+| Redis | ✅ Destruido | ✅ Destruido |
+| Cloud Run | ✅ Destruido | ✅ Destruido |
+| Load Balancer (forwarding rules) | ✅ Destruido | ✅ Destruido |
+| VPC Access Connector | ✅ Destruido | ✅ Destruido |
+| KMS (keyring + claves) | ⚠️ Quedará huérfano para siempre (limitación real de la API) | ⚠️ Ídem |
+| VPC + peering + IP reservada | ⏳ Pendiente (bloqueado por backups huérfanos) | ⏳ Pendiente (bloqueado por backups huérfanos) |
+
+**Sin costo real relevante mientras tanto** — todo lo que factura de forma significativa (cómputo, base de datos, caché, balanceador) ya está destruido en ambos entornos. Lo pendiente es exclusivamente de red (sin cómputo detrás) y KMS (sin coste por existir, solo por uso activo).
+
+**Siguiente paso al retomar** (mañana o cuando se reanude la sesión):
+```bash
+cd oms-platform/terraform
+terraform init -reconfigure -backend-config=envs/production.backend.hcl
+terraform destroy -var-file=envs/production.tfvars
+# Si falla igual, repetir con staging:
+terraform init -reconfigure -backend-config=envs/staging.backend.hcl
+terraform destroy -var-file=envs/staging.tfvars
+```
+Si el error persiste tras varias horas más de espera, investigar desde la consola web de GCP (IAM & Admin → Service Networking, o Cloud SQL → específicamente el historial de operaciones a nivel de proyecto) — hay reportes de que a veces requiere una intervención manual desde la consola (eliminar el peering desde la UI en vez de la CLI/Terraform) o, en casos extremos, contactar soporte de GCP si supera las 24-48h.
