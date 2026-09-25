@@ -62,6 +62,23 @@ module "network" {
 }
 
 # ┌─────────────────────────────────────────────────────────┐
+# │ Capa KMS: CMEK propia (bonus, ver terraform/modules/kms) │
+# └─────────────────────────────────────────────────────────┘
+# `count` en vez de un `for_each`/módulo siempre presente: con
+# enable_cmek=false (default), este módulo no se instancia en absoluto —
+# ni keyring ni claves existen, cero coste, cero superficie nueva. Con
+# count, las referencias a sus outputs más abajo necesitan el índice [0].
+module "kms" {
+  source = "./modules/kms"
+  count  = var.enable_cmek ? 1 : 0
+
+  project_id = var.project_id
+  region     = var.region
+  env        = var.env
+  labels     = local.common_labels
+}
+
+# ┌─────────────────────────────────────────────────────────┐
 # │ Capa de datos: Cloud SQL Postgres + Memorystore Redis   │
 # └─────────────────────────────────────────────────────────┘
 module "database" {
@@ -79,6 +96,10 @@ module "database" {
   # creación entre la conexión de peering (module.network) y Cloud
   # SQL/Redis (module.database) — ver comentarios en modules/database/main.tf.
   private_vpc_connection_id = module.network.private_vpc_connection_id
+  # Agregado por el equipo (Fase 7, bonus CMEK): try() devuelve "" si
+  # module.kms no existe (enable_cmek=false, count=0) sin que Terraform
+  # falle intentando indexar una lista vacía.
+  cmek_key_id = try(module.kms[0].cloudsql_key_id, "")
 }
 
 # ┌─────────────────────────────────────────────────────────┐
@@ -103,6 +124,9 @@ module "compute" {
   connector_subnet_name   = module.network.connector_subnet_name
   lb_domain               = var.lb_domain
   labels                  = local.common_labels
+  # Agregado por el equipo (Fase 7, bonus CMEK): mismo patrón try() que en
+  # module.database — "" si enable_cmek=false.
+  storage_cmek_key_id = try(module.kms[0].storage_key_id, "")
 }
 
 # ┌─────────────────────────────────────────────────────────┐

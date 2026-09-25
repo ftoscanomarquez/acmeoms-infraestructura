@@ -139,3 +139,15 @@ variable "lb_domain" {
   # permanente y fuerza destruir/recrear el certificado en cada apply.
   default = "pendiente-dominio-real.example.com"
 }
+
+# Agregado por el equipo (Fase 7, bonus CMEK): interruptor único para
+# activar/desactivar el módulo kms completo. `false` por defecto — activar
+# CMEK sobre una instancia de Cloud SQL YA EXISTENTE sin CMEK exige
+# recrearla (encryption_key_name es inmutable, ver modules/database), así
+# que este flag se decide una vez y se documenta la decisión real tomada
+# para cada entorno en envs/<env>.tfvars, no se cambia por capricho.
+variable "enable_cmek" {
+  type        = bool
+  description = "Activa CMEK propia (Cloud KMS) para Cloud SQL y el bucket de assets, en vez de las claves default de Google (bonus del enunciado)."
+  default     = false
+}

@@ -60,3 +60,7 @@ github_repository = "ftoscanomarquez/acmeoms-infraestructura"
 # vez de en staging.tfvars porque solo producción necesita leer de otro
 # proyecto (staging nunca necesita leer de sí mismo).
 staging_project_id = "acmeoms-staging-fatm"
+
+# BONUS (Fase 7): CMEK propia — mismo motivo y mismo detalle que en
+# staging.tfvars. Verificado primero en staging antes de aplicar aquí.
+enable_cmek = true

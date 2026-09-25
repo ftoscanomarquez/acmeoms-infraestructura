@@ -24,6 +24,23 @@ cloud_run_memory        = "2Gi"   # debe coincidir con ansible/group_vars/stagin
 image_repo = "europe-west3-docker.pkg.dev/acmeoms-staging-fatm/oms/oms"
 image_sha  = "sha256:d68ca4fc59a42a8f6bb74e9f82d937f545315230c7bc214880d1310907c62f72"
 
+# HALLAZGO REAL (Fase 7, verificación bonus CMEK): igual que
+# prevent_destroy (ver modules/database/main.tf), deletion_protection es
+# una SEGUNDA capa de defensa independiente contra el mismo tipo de
+# accidente — bajarla sin más habría sido un error de diseño (redundancia
+# real, no un descuido). GCP la exigió bajar también para poder recrear
+# la instancia con encryption_key_name (campo inmutable) — la recreación
+# ya se aplicó con éxito (CMEK real activo, verificado contra la API).
+# Restaurada a `true` de forma permanente.
 deletion_protection = true # también en staging
 
 github_repository = "ftoscanomarquez/acmeoms-infraestructura"
+
+# BONUS (Fase 7): CMEK propia en vez de la clave default de Google, para
+# Cloud SQL y el bucket de assets/SPA (terraform/modules/kms). Activado
+# desde staging primero — decisión real: no hay datos de negocio reales
+# en juego (solo el placeholder de infraestructura), así que recrear
+# Cloud SQL con encryption_key_name (campo inmutable, exige destroy+create)
+# no tiene ningún riesgo real aquí. Ver BITACORA-COMANDOS.md § 7.x para el
+# detalle completo de la verificación.
+enable_cmek = true

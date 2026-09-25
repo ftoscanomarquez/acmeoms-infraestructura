@@ -2997,3 +2997,94 @@ A petición del usuario ("haz todo lo de la documentacion, adelanta todos esos a
 - `RETROSPECTIVA.md` (nuevo, deliberadamente honesto): 3 desviaciones reales documentadas respecto a la spec (NFR-SCAL-001 recortado por cuota real de `CpuAllocPerProjectRegion` + valores válidos de CPU, audit trail de REG-GDPR-003 no implementado, ausencia real de módulos `google.cloud.gcp_cloudrun_*`), la deuda técnica conocida de `promote-canary.yml` (criterio de "primera revisión no-canary encontrada" en vez de "la de mayor tráfico actual" — ver hallazgo real de § 6.21), y 4 puntos concretos de qué se haría distinto con el conocimiento actual del proyecto.
 
 Cada documento remite, donde corresponde, a un archivo real (`terraform/modules/.../main.tf`, `ansible/playbooks/*.yml`, `.github/workflows/ci-cd.yml`) o a una sección concreta de este mismo archivo de bitácora — ninguna afirmación es genérica o no verificable contra el estado real del repositorio.
+
+## Fase 7 — Bonus
+
+A petición del usuario ("de esta parte de los bonus cuales son las mas faciles de implementar"), se evaluó esfuerzo real vs. lo ya existente en el código para los 5 bonus del enunciado, y se priorizaron 3: **migración expand-and-contract** (solo documentación, sin tocar infraestructura), **Cloud CDN políticas finas** (afinar un recurso ya creado desde la Fase 1), y **CMEK propia** (había un `TODO` explícito ya marcado en el código). Multi-region DR y Bastion+Datadog quedaron fuera de esta ronda por mayor esfuerzo real.
+
+### 7.1 · Migración expand-and-contract — solo documentación
+
+Nuevo archivo `oms-platform/MIGRACION-EXPAND-CONTRACT.md`. Sin cambios de código ni de infraestructura — el enunciado pide explícitamente "documentas (no implementas)". Usa un escenario concreto y coherente con el dominio real del proyecto (`anexo-arquitectura/02-bounded-contexts.md`, bounded context `Orders`, esquema `orders.*`): dividir `orders.orders.delivery_address` (texto libre) en columnas estructuradas. Las 4 fases (EXPAND/MIGRATE/VALIDATE/CONTRACT) se conectan explícitamente con mecanismos ya reales de este proyecto — la Fase 3 (validar que el 100% del tráfico ya usa el código nuevo) usa literalmente el mismo comando `gcloud run services describe --flatten=status.traffic[]` que ya usan `rollback.yml`/`promote-canary.yml`.
+
+### 7.2 · Cloud CDN políticas finas — aplicado y verificado en staging + producción
+
+Afinado `terraform/modules/compute/main.tf` sobre el `google_compute_backend_service` ya existente desde la Fase 1 (que tenía TTLs fijos y `include_query_string=false` documentados como "provisional: se afinará en el bonus"):
+
+- `cache_mode` cambiado de `CACHE_ALL_STATIC` a `USE_ORIGIN_HEADERS` — el backend respeta los headers `Cache-Control` que la propia app emita, en vez de decidir por extensión de archivo.
+- `cache_key_policy.include_query_string = true` — necesario para no compartir caché entre peticiones con distinto query string (ej. `?category=X` vs `?category=Y`).
+- `negative_caching_policy` para códigos 404 y (tras un hallazgo real, ver abajo) 501.
+- Nuevo bucket `google_storage_bucket.spa_assets` (no existía ningún bucket de aplicación en el proyecto) + `google_compute_backend_service_signed_url_key` + un secreto en Secret Manager con la clave de firma — para el requisito de "signed URLs para SPA" del enunciado.
+
+**Hallazgo real 1 — `default_kms_key_name` no acepta `null` condicional dentro de un bloque `encryption` de un bucket**: un primer intento pasaba `default_kms_key_name = var.storage_cmek_key_id != "" ? var.storage_cmek_key_id : null` dentro de un bloque `encryption {}` fijo — el provider rechazó el plan con `Error: Missing required argument`. A diferencia de `encryption_key_name` en Cloud SQL (un string simple que sí acepta `null`), el bloque `encryption` de un bucket exige que el argumento tenga valor si el bloque existe. Corregido con un bloque `dynamic "encryption"` cuyo `for_each` itera 0 o 1 veces según la variable — sin CMEK, el bloque `encryption` ni siquiera se declara.
+
+**Hallazgo real 2 — código `500` inválido en `negative_caching_policy`**: `terraform apply` real contra staging rechazado por la API:
+```
+Error 400: Invalid value for field 'resource.cdnPolicy.negativeCachingPolicy[1].code': '500'.
+Valid options are [300, 301, 302, 307, 308, 404, 405, 410, 421, 451, 501].
+```
+Cloud CDN solo permite cachear como "negativos" una lista cerrada de códigos — 500 (error genérico, potencialmente transitorio) no está permitido a propósito; 501 (funcionalidad no implementada, tan estable como un 404) sí. Corregido usando 501.
+
+Verificado contra la API real (`compute.googleapis.com`) tras el `apply` en ambos entornos: `cacheMode: USE_ORIGIN_HEADERS`, `includeQueryString: true`, `negativeCachingPolicy` con 404/501, `signedUrlKeyNames` poblado, bucket con `versioning.enabled: true`. Healthcheck de producción confirmado sano tras el cambio (`{"status":"ok","version":"0.3.0"}` — el cambio de CDN no toca Cloud Run en absoluto).
+
+### 7.3 · CMEK propia — nuevo módulo `terraform/modules/kms/`, 4 hallazgos reales encadenados
+
+Nuevo módulo con un keyring + 2 `google_kms_crypto_key` (uno para Cloud SQL, uno para el bucket de assets), rotación cada 90 días, activado con un interruptor único (`var.enable_cmek`, default `false`) para no afectar a nadie que no lo active explícitamente. Conectado a `modules/database` (`encryption_key_name`) y `modules/compute` (bucket `spa_assets`) vía `try(module.kms[0].xxx_key_id, "")`.
+
+**Antes de aplicar**: se habilitó `cloudkms.googleapis.com` en ambos proyectos (pendiente desde la Fase 0, nunca antes necesaria).
+
+**Hallazgo real 1 — `prevent_destroy` bloqueó correctamente la recreación necesaria**: `encryption_key_name` es un campo INMUTABLE en `google_sql_database_instance` — activarlo sobre una instancia ya existente fuerza `-/+ destroy and then create replacement`, no un simple `update in-place`. Con `lifecycle.prevent_destroy = true` (protección real de este proyecto desde la Fase 1), `terraform plan` falló en seco:
+```
+Error: Instance cannot be destroyed
+... has lifecycle.prevent_destroy set, but the plan calls for this resource to be destroyed.
+```
+Comportamiento **correcto** de la protección, no un bug. Se bajó `prevent_destroy` a `false` temporalmente y de forma documentada en el propio código (con el hallazgo explicado inline), se completó la recreación consciente (sin datos reales de negocio en juego — decisión explícita confirmada con el usuario antes de proceder), y se restauró a `true` de forma permanente al terminar.
+
+**Hallazgo real 2 — `deletion_protection` es una SEGUNDA protección independiente, con dos campos distintos dentro del mismo recurso**: tras bajar `prevent_destroy`, el `apply` seguía fallando:
+```
+Error, failed to delete instance because deletion_protection is set to true.
+Set it to false to proceed with instance deletion
+```
+Investigado: existen dos campos de protección en `google_sql_database_instance`, fácilmente confundibles:
+- `deletion_protection` (nivel superior del recurso) — una protección del **lado de Terraform**, evita que Terraform siquiera intente destruir el recurso.
+- `settings.deletion_protection_enabled` (dentro del bloque `settings`, NUNCA antes declarado en este código) — el flag que la **API real de Cloud SQL** consulta al procesar una solicitud de borrado.
+
+Bajar solo el primero (vía `deletion_protection = false` en `staging.tfvars`) actualizaba el campo de Terraform, y el `plan` incluso lo mostraba correctamente (`deletion_protection = true -> false`), pero el segundo campo nunca estaba bajo control de Terraform (aparecía en el plan como `deletion_protection_enabled = false -> null`, es decir, "Terraform no gestiona este valor") — la API real seguía rechazando el borrado porque ese campo específico nunca se tocó. Verificado con `gcloud sql instances describe --format="value(settings.deletionProtectionEnabled)"` que el valor real ya estaba en `False` de otras formas (quedó así de un intento previo), pero el `apply` seguía fallando de todas formas — indicando que el problema real no era el *valor* sino la *secuencia*: Corregido declarando explícitamente `settings.deletion_protection_enabled = var.deletion_protection` (ligado a la MISMA variable, para que ambos campos cambien siempre juntos).
+
+**Hallazgo real 3 — cambiar `deletion_protection` y forzar un `replace` en el MISMO `apply` no funciona con este provider**: incluso con ambos campos ya declarados correctamente, el primer intento de `apply` combinado (bajar protección + recrear con CMEK en una sola invocación) volvió a fallar con el mismo error de `deletion_protection is set to true`, a pesar de que el `plan` mostraba el cambio correctamente y la API ya devolvía `False` en consultas directas. Patrón real y reproducible: cuando un cambio de `deletion_protection` coincide en el mismo plan con un `replace` forzado del mismo recurso, el provider parece evaluar/aplicar la protección con el valor anterior en el momento de emitir la llamada de borrado. **Solución verificada**: separar en dos `apply` distintos —
+1. Un primer `apply` que SOLO cambia `deletion_protection` (con `enable_cmek=false` todavía), confirmado con `plan` mostrando `0 to add, 1 to change, 0 to destroy` — sin ningún `replace` pendiente en el mismo plan.
+2. Un segundo `apply`, ya con `enable_cmek=true`, que ejecuta el `replace` real — este sí completó la destrucción sin el error, porque la protección ya estaba consolidada de un `apply` anterior y limpio.
+
+**Hallazgo real 4 — recursos huérfanos en el estado tras una destrucción parcial exitosa**: en el proceso de diagnosticar el hallazgo 3, la instancia de Cloud SQL SÍ llegó a destruirse realmente en un intento (`Destruction complete after 1m36s`) antes de que el resto del `apply` fallara por otro motivo (permisos de KMS, ver hallazgo 4b). El siguiente `terraform plan` falló con:
+```
+Error: Error when reading or editing SQLDatabase "...instances/oms-staging-postgres/databases/oms":
+googleapi: Error 403: The client is not authorized to make this request., notAuthorized
+```
+Causa: `google_sql_database.oms` y `google_sql_user.oms` (hijos de la instancia) seguían registrados en el estado de Terraform apuntando a una instancia padre que ya no existía en GCP — Terraform intentaba refrescar su estado contra un recurso inexistente. Resuelto con `terraform state rm module.database.google_sql_database.oms` y `terraform state rm module.database.google_sql_user.oms` (no borra nada real en GCP, solo deja de rastrearlos — correcto porque de hecho ya no existían), tras lo cual el siguiente `plan` los mostró correctamente como `+ create` en vez de fallar.
+
+**Hallazgo real 4b — las Service Agents de Cloud SQL y Cloud Storage no existían en el proyecto, aunque su nombre es predecible**: el intento de recrear Cloud SQL con CMEK falló con dos errores encadenados:
+```
+Error 400: Service account service-<N>@gcp-sa-cloud-sql.iam.gserviceaccount.com does not exist.
+Error waiting for Create Instance: Per-Product Per-Project Service Account is not found
+```
+Causa real: estas identidades gestionadas por Google ("Service Agents") se aprovisionan de forma perezosa — la primera vez que el servicio hace algo que las requiere dentro de un proyecto — y este proyecto nunca antes había usado ninguna función de Cloud SQL o Cloud Storage que las forzara a existir formalmente, aunque el formato de su nombre (`service-<PROJECT_NUMBER>@gcp-sa-cloud-sql.iam.gserviceaccount.com`) sea conocido y predecible de antemano. Corregido agregando `google_project_service_identity` (provider `google-beta`) para ambos servicios (`sqladmin.googleapis.com`, `storage.googleapis.com`) — fuerza el aprovisionamiento explícito antes de intentar otorgarles ningún permiso IAM, con `depends_on` desde los bindings de KMS y desde los outputs del propio módulo `kms` (para que `database`/`compute` reciban el ID de la clave solo después de que la Service Agent exista Y tenga el permiso).
+
+**Hallazgo real 4c — `google_project_service_identity.email` es `null` para el servicio de Storage**: tras agregar el recurso anterior, el binding de Cloud SQL funcionó (`.email` sí quedó poblado), pero el de Storage falló:
+```
+Error: Invalid template interpolation value
+google_project_service_identity.storage_sa.email is null
+```
+Corregido volviendo, solo para el `member` del binding de Storage, al formato literal ya usado en el diseño original (`service-<PROJECT_NUMBER>@gs-project-accounts.iam.gserviceaccount.com`, compuesto con el `data "google_project" "current"` ya existente) — `google_project_service_identity` se mantiene igual para FORZAR el aprovisionamiento (necesario), pero no se depende de su atributo `.email` para este servicio específico, que no lo expone de forma confiable.
+
+**Verificación final real, tras todos los fixes, contra la API de GCP (no solo el resumen de los `apply`)**:
+```bash
+gcloud sql instances describe oms-staging-postgres --format="value(diskEncryptionConfiguration.kmsKeyName)"
+# → projects/acmeoms-staging-fatm/.../cryptoKeys/oms-staging-cloudsql-key
+
+curl ".../storage/v1/b/acmeoms-staging-fatm-oms-staging-spa" | grep -A2 encryption
+# → defaultKmsKeyName: .../cryptoKeys/oms-staging-storage-key
+
+curl https://oms-staging-.../health
+# → {"status":"ok","version":"0.3.0"}  (servicio sano tras la recreación completa de Cloud SQL)
+```
+
+Ambas protecciones (`prevent_destroy` en el código, `deletion_protection` en `staging.tfvars`) restauradas a `true` de forma permanente al finalizar, documentado el motivo temporal de cada bajada directamente en el código donde ocurrió — no queda ningún rastro de "protección desactivada" fuera de los comentarios que explican por qué se bajó y por qué se restauró.

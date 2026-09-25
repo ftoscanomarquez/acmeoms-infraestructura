@@ -16,6 +16,15 @@ variable "labels" { type = map(string) }
 # — sin esto, Terraform puede lanzarlos en paralelo y fallan con
 # "network doesn't have at least 1 private services connection".
 variable "private_vpc_connection_id" { type = string }
+# Agregado por el equipo (Fase 7, bonus CMEK): ID completo de la clave KMS
+# gestionada por el proyecto (module.kms), en vez de la clave default de
+# Google. Nullable a propósito (default ""): permite que este módulo siga
+# funcionando sin CMEK si algún día se quisiera desactivar el bonus sin
+# tocar el resto del módulo.
+variable "cmek_key_id" {
+  type    = string
+  default = ""
+}
 
 # ─── Password aleatoria gestionada por GCP en Secret Manager ──────
 #
@@ -62,12 +71,41 @@ resource "google_sql_database_instance" "main" {
   region              = var.region
   deletion_protection = var.deletion_protection
 
+  # BONUS (Fase 7, ver TODO original ya resuelto más abajo): CMEK propia
+  # en vez de la clave default de Google — module.kms crea el keyring +
+  # la clave y otorga el permiso necesario a la Service Agent de Cloud
+  # SQL. `encryption_key_name` es INMUTABLE tras la creación de la
+  # instancia (GCP no permite "re-cifrar" una instancia existente con otra
+  # clave sin recrearla) — por eso se pasa desde el primer `apply` donde
+  # se active, nunca como una actualización posterior sobre una instancia
+  # ya existente.
+  encryption_key_name = var.cmek_key_id != "" ? var.cmek_key_id : null
+
   settings {
     tier              = var.db_tier
     availability_type = "REGIONAL" # NFR-AVAIL-001 multi-zone HA
     disk_size         = 100
     disk_type         = "PD_SSD"
     disk_autoresize   = true
+
+    # HALLAZGO REAL (Fase 7, verificación bonus CMEK): existen DOS campos
+    # de protección distintos y fácilmente confundibles en este recurso:
+    #   - `deletion_protection` (nivel superior, ya usado arriba): una
+    #     protección del LADO DE TERRAFORM, evita que un `terraform
+    #     destroy`/plan de reemplazo siquiera lo intente.
+    #   - `settings.deletion_protection_enabled` (este campo, nunca antes
+    #     declarado en este código): el flag REAL que la propia API de
+    #     Cloud SQL consulta al procesar una solicitud de borrado — vive
+    #     "por debajo" del anterior y es independiente de él.
+    # Sin declarar este segundo campo explícitamente, Terraform nunca lo
+    # actualiza (queda fuera de su control, "null" en el plan) — aunque el
+    # de nivel superior cambiara a `false` y el `plan` lo mostrara
+    # correctamente, la API real seguía rechazando el borrado real con
+    # "failed to delete instance because deletion_protection is set to
+    # true", porque el campo que la API realmente mira nunca se tocó. Se
+    # declara aquí, ligado a la MISMA variable, para que ambos cambien
+    # siempre juntos y no puedan desincronizarse otra vez.
+    deletion_protection_enabled = var.deletion_protection
 
     backup_configuration {
       enabled                        = true
@@ -163,14 +201,31 @@ resource "google_sql_database_instance" "main" {
       value = "0"
     }
 
-    # TODO(alumno) [BONUS CMEK]: añade encryption_key_name apuntando a una CMEK propia
-    # en lugar de la clave gestionada por Google.
-
     user_labels = var.labels
   }
 
   lifecycle {
-    prevent_destroy = true # defensa adicional contra terraform destroy
+    # HALLAZGO REAL (Fase 7, verificación real del bonus CMEK): al activar
+    # `enable_cmek=true` por primera vez, `encryption_key_name` cambia de
+    # null a un valor real — GCP marca ese campo como "forces replacement"
+    # (es inmutable, no se puede aplicar a una instancia ya existente sin
+    # recrearla). Con `prevent_destroy = true` activo, `terraform plan`
+    # fallaba en seco:
+    #   "Error: Instance cannot be destroyed ... has lifecycle.prevent_destroy
+    #    set, but the plan calls for this resource to be destroyed."
+    # Comportamiento CORRECTO de la protección — no es un bug a silenciar
+    # sin más. Este módulo es compartido por staging Y producción: se baja
+    # temporalmente cada vez que hace falta recrear la instancia de UN
+    # entorno concreto (primero staging, ahora producción, ambas
+    # recreaciones conscientes, sin datos reales de negocio en juego), y
+    # se restaura a `true` de forma permanente en cuanto ese entorno
+    # concreto termina su `apply` — el campo `lifecycle` no forma parte
+    # del estado remoto del recurso, así que alternarlo no es destructivo
+    # ni fuerza cambios en la instancia ya creada.
+    # Restaurada a `true` de forma permanente tras completar la
+    # recreación consciente en AMBOS entornos (staging y producción), con
+    # CMEK real ya activo y verificado contra la API en los dos.
+    prevent_destroy = true
   }
 
   # NOTA DE DISEÑO (agregado por el equipo, hallazgo real durante el primer

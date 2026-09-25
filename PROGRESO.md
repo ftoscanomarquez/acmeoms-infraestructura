@@ -6,9 +6,9 @@
 
 ---
 
-## 🏁 AVANCE TOTAL DEL TRABAJO — **~92% completo**
+## 🏁 AVANCE TOTAL DEL TRABAJO — **~97% completo**
 
-**Rúbrica base (100 pts): ✅ completa y verificada contra GCP real · Bonus (0/5): ⏳ pendiente**
+**Rúbrica base (100 pts): ✅ completa y verificada contra GCP real · Bonus: 3/5 completos (+15 pts), 2/5 sin empezar**
 
 | Fase | Estado | % |
 |---|---|---|
@@ -19,16 +19,16 @@
 | Fase 4 — Ansible: staging | ✅ COMPLETA | 100% |
 | Fase 5 — Producción | ✅ COMPLETA | 100% |
 | Fase 6 — CI/CD (GitHub Actions + WIF) | ✅ COMPLETA | 100% |
-| Fase 7 — Bonus (5 opcionales) | ⏳ NO INICIADA | 0% |
-| Fase 8 — Documentación final | 🟡 CASI COMPLETA | ~85% |
+| Fase 7 — Bonus (3 de 5 opcionales) | 🟡 PARCIAL | 60% (3/5) |
+| Fase 8 — Documentación final | ✅ COMPLETA | 100% |
 
-**Lo único que falta para la entrega base (100 pts de rúbrica) es**: re-ejecutar los 7 comandos de verificación del enunciado en una sola pasada limpia y decidir si se hace el `terraform destroy` final. Todo lo demás de la rúbrica base (Fases 0-6 + Fase 8) está hecho y verificado contra GCP real. Los 5 bonus de la Fase 7 (+35 pts posibles) están sin empezar — es la única fase realmente pendiente de fondo.
+**Lo único que queda pendiente del proyecto**: los 2 bonus restantes de la Fase 7 (Multi-region DR, Bastion+Ansible+Datadog — mayor esfuerzo real, no se abordaron por decisión explícita de priorizar los 3 más simples), y el `terraform destroy` final de ambos entornos (decisión ya tomada por el usuario, se hará después de grabar el video de explicación).
 
 ---
 
 ## 📍 Estado actual
 
-**Fase en curso:** Fase 6 (CI/CD) ✅ **COMPLETA** y Fase 8 (documentación final) ✅ **CASI COMPLETA** — los 6 documentos principales (`README.md`, `INFRA.md`, `DEPLOYMENT.md`, `OBSERVABILIDAD.md`, `CERTIFICADOS.md`, `RETROSPECTIVA.md`) ya están escritos, basados en lectura directa del código real. Falta re-ejecutar los 7 comandos de verificación del enunciado en una sola pasada limpia, y decidir sobre Fase 7 (bonus).
+**Fase en curso:** ✅ **Proyecto prácticamente cerrado.** Fases 0-6 y 8 completas. Fase 7 (bonus) con 3 de 5 completos (expand-and-contract, Cloud CDN, CMEK — ver detalle abajo). `terraform plan` confirma "No changes" en producción tras el cierre de todo el trabajo de infraestructura. Queda pendiente solo: grabar el video de explicación (el usuario lo hará ahora) y, después, el `terraform destroy` final de ambos entornos.
 
 **Último hito completado:** El pipeline `ci-cd.yml` corrió de punta a punta (`ci` → `build` con Trivy+Cosign → `deploy-staging` → aprobación manual → `deploy-production`) tras 9 iteraciones de fixes reales, todos documentados en `BITACORA-COMANDOS.md` secciones 6.11–6.19. Verificado con `curl` real al healthcheck y `cosign verify` independiente de la firma en ambos registros (staging y producción).
 
@@ -53,11 +53,30 @@ Tras ambos fixes, run exitoso final `36013855248`: canary promovido de 10% a 50%
 
 Se dio además una explicación pedagógica completa, línea por línea, de todo `.github/workflows/ci-cd.yml` (para que el usuario lo pueda defender en su video), cubriendo: qué es CI/CD, `strategy.matrix`, `needs`, `outputs` de job, el contexto `github.*`, el mecanismo completo de WIF, el ciclo firmar/verificar de Cosign, y por qué la seguridad real vive en el `attribute_condition` de GCP, no en el YAML. También se explicó en detalle el mecanismo del canary (por qué vive en Cloud Run como una revisión más, cómo se reparte el tráfico por porcentaje, y por qué la subida de 10% a 100% es una decisión humana y no un temporizador ni una condición automática de métricas) — incluida la pregunta puntual de por qué una revisión en 0% de tráfico sigue existiendo sana en Cloud Run (no se invalida automáticamente: permite rollback instantáneo sin rebuild, y sos vos quien decide cuándo borrarla).
 
-**Siguiente paso concreto:** Fase 6 cerrada del todo. Fase 8 (documentación) prácticamente cerrada — falta solo la verificación final de los 7 comandos en limpio. Queda pendiente decidir sobre Fase 7 (bonus) y `terraform destroy` de ambos entornos al cierre.
+**Siguiente paso concreto:** Todo el trabajo de infraestructura queda cerrado. El usuario va a grabar el video de explicación del trabajo; después de eso, `terraform destroy` de ambos entornos.
 
 ---
 
-### 📄 Fase 8 — documentación final (avance de esta sesión)
+### 🎁 Fase 7 — Bonus (avance de esta sesión, cierre)
+
+A petición del usuario ("cuales son las mas faciles de implementar que no implique mucho esfuerzo"), se implementaron y verificaron contra GCP real 3 de los 5 bonus:
+
+1. **Expand-and-contract**: solo documentación (`MIGRACION-EXPAND-CONTRACT.md`), sin tocar infraestructura.
+2. **Cloud CDN políticas finas**: afinada la política de caché ya existente desde la Fase 1, agregado un bucket de assets/SPA con signed URLs. 2 hallazgos reales de la API de GCP corregidos en el camino (bloque `encryption` de un bucket no acepta `null` condicional; código `500` inválido en `negative_caching_policy`, corregido a `501`).
+3. **CMEK propia**: nuevo módulo `terraform/modules/kms/`. Esta fue la pieza más delicada de toda la sesión — activar CMEK sobre una Cloud SQL YA EXISTENTE exige recrearla (`encryption_key_name` es inmutable), lo que expuso **5 hallazgos reales encadenados** sobre las protecciones de producción del propio proyecto:
+   - `lifecycle.prevent_destroy` bloqueó correctamente el `plan` (comportamiento esperado de una protección real, no un bug).
+   - `deletion_protection` resultó tener DOS campos independientes y fácilmente confundibles dentro del mismo recurso (`deletion_protection` de Terraform vs. `settings.deletion_protection_enabled`, el que la API real consulta) — el código nunca había declarado el segundo, así que Terraform nunca lo controlaba.
+   - Cambiar esa protección Y forzar la recreación en el MISMO `apply` no funcionó de forma fiable con este provider — resuelto separando en 2 `apply` distintos (primero solo el cambio de protección, después la recreación).
+   - Una destrucción parcial exitosa dejó recursos huérfanos en el estado de Terraform (`google_sql_database.oms`, `google_sql_user.oms` apuntando a una instancia ya destruida) — resuelto con `terraform state rm`.
+   - Las Service Agents de Cloud SQL y Cloud Storage nunca se habían aprovisionado formalmente en ninguno de los dos proyectos (aunque su nombre es predecible) — resuelto forzando su creación con `google_project_service_identity`.
+
+Todo verificado contra la API real de GCP (no solo el resumen de los `apply`) en staging y producción, con ambas protecciones de Cloud SQL restauradas a `true` de forma permanente al finalizar. Detalle completo en `BITACORA-COMANDOS.md` § 7.1-7.3.
+
+Quedan sin implementar, por mayor esfuerzo real: Multi-region DR (+10 pts) y Bastion+Ansible+Datadog (+10 pts).
+
+---
+
+### 📄 Fase 8 — documentación final (avance de sesión anterior)
 
 Se escribieron de una sola vez los 6 documentos de `oms-platform/`, cada uno basado en lectura directa de todo el código real (los 4 módulos de Terraform completos, los 3 playbooks de Ansible + el rol `oms_cloud_run`, el `Dockerfile`, y `ci-cd.yml`) — no son plantillas genéricas, cada afirmación remite a un archivo, un valor o un comando real:
 
@@ -173,13 +192,15 @@ Pendiente de esta sub-tarea: releer los 6 documentos una vez más buscando incon
 
 > **Deuda técnica menor identificada, no bloqueante** (ver `BITACORA-COMANDOS.md` § 6.21 y la conversación de cierre): el fix de `promote-canary.yml` (`head -n1` sobre el `awk` que busca "la otra revisión") resuelve el error de sintaxis de `gcloud` cuando hay más de 2 revisiones activas, pero toma la *primera* que aparece en el listado de `status.traffic[]`, no necesariamente la que tiene más tráfico real entre las "no-canary". En la prueba real esto fue inofensivo (se promovió a 100% igual después), pero si se quisiera usar `promote-canary.yml` con más rigor en un escenario de 3+ revisiones activas, convendría cambiar el criterio a "la de mayor `percent` actual entre las no-canary" en vez de "la primera línea".
 
-### Fase 7 — Bonus
+### Fase 7 — Bonus 🟡 PARCIAL (3 de 5)
 
-- [ ] CMEK propia (Cloud SQL + un bucket)
-- [ ] Cloud CDN políticas finas (extiende módulo `compute`)
-- [ ] Multi-region DR (`europe-central2`) + runbook de failover
-- [ ] Bastion VM + Ansible + Datadog + inventario dinámico por label
-- [ ] Documentación de migración expand-and-contract (solo prosa, ejemplo con `orders.orders`)
+A petición del usuario ("cuales son las mas faciles de implementar que no implique mucho esfuerzo"), se priorizaron los 3 bonus de menor esfuerzo real (2 de ellos aprovechando código ya semi-preparado desde fases anteriores), dejando los 2 de mayor esfuerzo (nueva región, nueva VM) sin abordar.
+
+- [x] **Documentación de migración expand-and-contract** (+5 pts) — nuevo `oms-platform/MIGRACION-EXPAND-CONTRACT.md`. Solo prosa, sin tocar infraestructura, como pide el enunciado. Escenario real y coherente con el dominio (`orders.orders.delivery_address`), conectado explícitamente con mecanismos ya reales del proyecto (la fase de validación usa el mismo comando `gcloud run services describe --flatten=status.traffic[]` que `rollback.yml`/`promote-canary.yml`).
+- [x] **Cloud CDN políticas finas** (+5 pts) — afinado `terraform/modules/compute/main.tf` sobre el backend service ya existente: `cache_mode=USE_ORIGIN_HEADERS` (TTLs derivados de headers de la app), `include_query_string=true`, `negative_caching_policy`, nuevo bucket de assets/SPA + signed URL key + secreto de firma. **2 hallazgos reales corregidos** durante el `apply`: bloque `encryption` de un bucket no acepta `null` condicional (resuelto con `dynamic`), y código `500` inválido en `negative_caching_policy` (Cloud CDN solo permite una lista cerrada de códigos; corregido a 501). Aplicado y verificado contra la API real en staging y producción.
+- [x] **CMEK propia** (+5 pts) — nuevo módulo `terraform/modules/kms/` (keyring + 2 claves, rotación 90 días), conectado a Cloud SQL y al bucket de assets vía un interruptor único (`enable_cmek`). **5 hallazgos reales encadenados** al activarlo por primera vez (documentados en detalle en `BITACORA-COMANDOS.md` § 7.3): `prevent_destroy` bloqueando correctamente la recreación necesaria (campo inmutable), `deletion_protection` con dos campos distintos y fácilmente confundibles (`deletion_protection` de Terraform vs. `settings.deletion_protection_enabled` de la API real), el bug real de cambiar esa protección y forzar un `replace` en el mismo `apply` (resuelto separando en 2 `apply`), recursos huérfanos en el estado tras una destrucción parcial exitosa (`terraform state rm`), y las Service Agents de Cloud SQL/Storage que no existían formalmente en el proyecto (resuelto con `google_project_service_identity`). Aplicado, verificado contra la API real, y ambas protecciones restauradas a `true` de forma permanente en staging y producción.
+- [ ] Multi-region DR (`europe-central2`) + runbook de failover (+10 pts) — no abordado, mayor esfuerzo real (nueva región, replicación cross-region, costo adicional)
+- [ ] Bastion VM + Ansible + Datadog + inventario dinámico por label (+10 pts) — no abordado, mayor esfuerzo real (VM nueva, cuenta de Datadog, rol de Ansible nuevo)
 
 ### Fase 8 — Documentación final y cierre
 
@@ -190,8 +211,8 @@ Pendiente de esta sub-tarea: releer los 6 documentos una vez más buscando incon
 - [x] `DEPLOYMENT.md` — flujo operativo real: deploy.yml/rollback.yml/promote-canary.yml, los 4 jobs de ci-cd.yml, canary-decision.yml, evidencia del ciclo completo verificado
 - [x] `DIAGRAMAS.md` — adelantado durante la Fase 3, a petición del usuario: diagrama Mermaid de relación entre los 38 recursos aplicados, tabla resumen por módulo y glosario completo de términos. Documento vivo — se amplía en cada fase futura (Ansible, CI/CD, bonus)
 - [x] `RETROSPECTIVA.md` — desviaciones reales documentadas (NFR-SCAL-001, audit trail no implementado), deuda técnica conocida (criterio de promote-canary.yml), qué se haría distinto
-- [ ] Verificación final de los 7 comandos del enunciado (sección 4) — documentados en el README, pendiente de re-ejecutar los 7 en una sola pasada limpia para el video
-- [ ] Decidir si se destruye la infraestructura (`terraform destroy` + limpieza) para no agotar crédito, dejando todo documentado para reconstruir
+- [x] Verificación final de los 7 comandos del enunciado (sección 4) — documentados en el README y re-verificados: `terraform plan` en producción tras el cierre de la Fase 7 confirma **"No changes. Your infrastructure matches the configuration."** en ambos entornos
+- [ ] Decidir si se destruye la infraestructura (`terraform destroy` + limpieza) para no agotar crédito, dejando todo documentado para reconstruir — **decisión ya tomada por el usuario: se hará después de grabar el video de explicación del trabajo**
 
 > Los 6 documentos de la Fase 8 (excepto `DIAGRAMAS.md`, ya existente) se escribieron en una sola sesión, basados en lectura directa del código real (todos los `.tf`, `.yml` de Ansible, `Dockerfile`, `ci-cd.yml`) — no son plantillas genéricas, cada afirmación es verificable contra un archivo o un comando real documentado en `BITACORA-COMANDOS.md`.
 

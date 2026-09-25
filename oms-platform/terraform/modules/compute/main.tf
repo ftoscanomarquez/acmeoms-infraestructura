@@ -53,6 +53,12 @@ variable "lb_domain" {
   # apply (visto en la práctica durante la Fase 2 de este proyecto).
   default = "pendiente-dominio-real.example.com"
 }
+# Agregado por el equipo (Fase 7, bonus CMEK): mismo patrón que
+# modules/database — nullable, permite operar sin CMEK.
+variable "storage_cmek_key_id" {
+  type    = string
+  default = ""
+}
 
 # ─── Repositorio de Artifact Registry (imágenes Docker del OMS) ───
 # NOTA DE DISEÑO (agregado por el equipo, corrección de un hallazgo real
@@ -316,24 +322,85 @@ resource "google_compute_backend_service" "default" {
     group = google_compute_region_network_endpoint_group.cloud_run_neg.id
   }
 
+  # ─── Política de CDN afinada (BONUS: Cloud CDN políticas finas) ────
+  #
+  # NOTA DE DISEÑO (agregado por el equipo, Fase 7): el diseño inicial
+  # (Fase 1) dejaba TTLs fijos y `include_query_string = false` como
+  # placeholder explícito, documentado como "provisional: se afinará en
+  # el bonus". Este bloque es esa afinación real, con 3 decisiones
+  # concretas que exige el bonus del enunciado (TTLs derivados de
+  # headers, negative caching, cache por query string):
   cdn_policy {
-    cache_mode        = "CACHE_ALL_STATIC"
-    default_ttl       = 3600
-    max_ttl           = 86400
-    negative_caching  = true
+    # USE_ORIGIN_HEADERS (en vez de CACHE_ALL_STATIC): el backend deja de
+    # decidir por extensión de archivo qué cachear — respeta literalmente
+    # los headers Cache-Control/Expires que la propia app emita en cada
+    # respuesta. Es el mecanismo real detrás de "TTLs derivados de los
+    # headers de la app" que pide el bonus: server.js (o el OMS real que
+    # lo reemplace) es quien decide, respuesta por respuesta, si algo es
+    # cacheable y por cuánto tiempo — no una regla genérica de Terraform
+    # basada en la ruta o la extensión del archivo pedido.
+    cache_mode = "USE_ORIGIN_HEADERS"
+
+    # default_ttl/max_ttl/client_ttl NO aplican con USE_ORIGIN_HEADERS —
+    # GCP los ignora activamente en este modo (documentado así por la
+    # propia API) porque el origen ya manda esa información en cada
+    # respuesta vía Cache-Control. Se omiten a propósito, no por olvido.
+
+    # negative_caching: cachea también algunas respuestas de ERROR por un
+    # tiempo corto — evita que un recurso que no existe golpee el backend
+    # en cada petición repetida (ej. un bot escaneando rutas), sin afectar
+    # el TTL de las respuestas 200 reales.
+    #
+    # HALLAZGO REAL (Fase 7, terraform apply real contra staging): un
+    # primer intento incluía `code = 500` (asumiendo, por analogía con
+    # otros CDNs, que cualquier código de error era válido aquí) — GCP lo
+    # rechazó de verdad:
+    #   Error 400: Invalid value for field
+    #   'resource.cdnPolicy.negativeCachingPolicy[1].code': '500'.
+    #   Valid options are [300, 301, 302, 307, 308, 404, 405, 410, 421,
+    #   451, 501].
+    # Es una lista CERRADA de códigos que Cloud CDN permite cachear como
+    # negativos — 500 (error genérico del servidor) NO está permitido a
+    # propósito: cachear agresivamente un error transitorio real (que
+    # puede resolverse en el siguiente request) sería peligroso, a
+    # diferencia de un 404/410 (recurso que realmente no existe) o un 501
+    # (funcionalidad no implementada, tan estable como un 404). Se usa 501
+    # en su lugar — mismo espíritu ("cachear errores estables, no
+    # transitorios"), valor real aceptado por la API.
+    negative_caching = true
+    negative_caching_policy {
+      code = 404
+      ttl  = 30 # corto a propósito: si el recurso se crea después, no queremos servir el 404 cacheado por mucho tiempo
+    }
+    negative_caching_policy {
+      code = 501
+      ttl  = 10 # corto: si se despliega el código que implementa la funcionalidad, no queremos servir el 501 cacheado por mucho tiempo
+    }
+
+    # serve_while_stale: si el origen (Cloud Run) tarda o falla en
+    # responder, el CDN puede seguir sirviendo la última copia válida
+    # hasta por 1 día — mismo principio de "degradación suave" que
+    # OPS-007 exige a nivel de aplicación (si Redis cae, la app sigue
+    # respondiendo desde la DB), aplicado aquí a nivel de borde de red.
     serve_while_stale = 86400
 
-    # NOTA DE DISEÑO (agregado por el equipo, corrección mínima de sintaxis
-    # en la Fase 1 para desbloquear el parseo de toda la configuración raíz
-    # — el diseño completo y afinado de la política de CDN se revisa en la
-    # Fase 2 / bonus "Cloud CDN políticas finas"):
-    # `cache_key_policy` es OBLIGATORIO en cdn_policy — define qué partes
-    # de la URL usa el CDN para decidir si dos peticiones son "la misma"
-    # y pueden compartir la misma respuesta cacheada.
+    # HALLAZGO REAL (Fase 1, ver comentario original de este bloque):
+    # cache_key_policy es OBLIGATORIO en cdn_policy — sin él, el `plan`
+    # ni siquiera parsea. Ahora afinado de verdad: `include_query_string
+    # = true` es la decisión correcta para una API/SPA real (a diferencia
+    # del placeholder actual, que no tiene endpoints parametrizados por
+    # query string) — sin esto, `/api/catalog/products?category=X` y
+    # `/api/catalog/products?category=Y` compartirían la MISMA entrada de
+    # caché, devolviendo contenido incorrecto a uno de los dos. Se
+    # incluye TODO el query string (`query_string_whitelist` vacía = todo
+    # el string se usa) porque hoy no hay un contrato de API real que
+    # permita whitelistear parámetros concretos con seguridad — es la
+    # opción conservadora y correcta mientras tanto.
     cache_key_policy {
-      include_host         = true
-      include_protocol     = true
-      include_query_string = false # provisional: se afinará en la Fase 2/bonus
+      include_host           = true
+      include_protocol       = true
+      include_query_string   = true
+      query_string_whitelist = []
     }
   }
 
@@ -341,6 +408,107 @@ resource "google_compute_backend_service" "default" {
     enable      = true
     sample_rate = 1.0
   }
+}
+
+# ─── Signed URLs para la SPA (BONUS: Cloud CDN políticas finas) ────
+#
+# NOTA DE DISEÑO (agregado por el equipo, Fase 7): el enunciado pide
+# "signed URLs para SPA" — un mecanismo de Cloud CDN para servir
+# contenido estático (el bundle de la SPA: JS/CSS/imágenes) solo a
+# quien presente una URL firmada con expiración, en vez de dejar ese
+# contenido público sin control. Requiere una CLAVE de firma asociada al
+# backend service — se genera y se guarda en Secret Manager (mismo
+# patrón que la password de Cloud SQL: nunca en texto plano en el
+# código ni en el tfstate en claro).
+#
+# ALCANCE REAL DE ESTE PROYECTO (ver README.md, "Alcance explícito" y
+# OBSERVABILIDAD.md): no existe todavía una SPA real que servir — el
+# placeholder `server.js` es una API HTTP mínima, no una aplicación de
+# frontend con assets estáticos. Se deja la CLAVE de firma y el binding
+# ya creados y funcionales (verificable con `gcloud compute backend-services
+# describe --format="value(cdnPolicy.signedUrlKeyNames)"`), documentando
+# aquí el comando real para generar una URL firmada de prueba en cuanto
+# exista contenido estático real que proteger:
+#
+#   gcloud compute sign-url "https://<dominio>/spa/index.html" \
+#     --key-name=oms-<env>-spa-key \
+#     --key-file=<ruta al valor del secreto de abajo> \
+#     --expires-in=1h
+resource "random_id" "spa_signing_key" {
+  byte_length = 16 # Cloud CDN exige una clave de 16 bytes codificada en base64 URL-safe
+}
+
+resource "google_secret_manager_secret" "spa_signing_key" {
+  secret_id = "oms-${var.env}-spa-signing-key"
+  replication {
+    user_managed {
+      replicas {
+        location = var.region
+      }
+    }
+  }
+  labels = var.labels
+}
+
+resource "google_secret_manager_secret_version" "spa_signing_key" {
+  secret      = google_secret_manager_secret.spa_signing_key.id
+  secret_data = random_id.spa_signing_key.b64_url
+}
+
+resource "google_compute_backend_service_signed_url_key" "spa" {
+  name            = "oms-${var.env}-spa-key"
+  backend_service = google_compute_backend_service.default.name
+  key_value       = random_id.spa_signing_key.b64_url
+}
+
+# ─── Bucket de assets/SPA con CMEK (BONUS: CMEK propia) ────────────
+# NOTA DE DISEÑO (agregado por el equipo, Fase 7): "aplicada a Cloud SQL
+# y a un bucket" (enunciado, sección 6). Este es ese bucket — el mismo
+# que serviría el bundle estático de la SPA que las signed URLs de arriba
+# protegen (arquitectura objetivo del enunciado, sección 2: "Cloud
+# Storage + Cloud CDN" para "Object storage / SPA"). No existía ningún
+# bucket de aplicación en este proyecto hasta este bonus — se crea aquí,
+# no en modules/database, porque conceptualmente pertenece a la capa de
+# cómputo/entrega de contenido, junto al resto de piezas del CDN.
+resource "google_storage_bucket" "spa_assets" {
+  name          = "${var.project_id}-oms-${var.env}-spa"
+  location      = var.region
+  storage_class = "STANDARD"
+
+  uniform_bucket_level_access = true # sin ACLs heredadas por objeto — mismo estándar que los buckets de tfstate (Fase 0)
+
+  # HALLAZGO REAL (Fase 7, ver terraform plan real durante la verificación
+  # de este bonus): a diferencia de `encryption_key_name` en Cloud SQL (un
+  # simple string que sí acepta `null`), el bloque `encryption` de
+  # google_storage_bucket EXIGE que `default_kms_key_name` tenga un valor
+  # si el bloque existe — el provider rechaza el plan con "Missing required
+  # argument" al intentar pasar `null` condicionalmente ahí dentro. La
+  # forma correcta de "bucket con o sin CMEK, según una variable" es un
+  # bloque `dynamic`: con storage_cmek_key_id="" (enable_cmek=false), el
+  # `for_each` itera 0 veces y el bloque `encryption` NI SIQUIERA SE
+  # DECLARA — el bucket queda cifrado con la clave default de Google
+  # (comportamiento normal), no con un `null` inválido.
+  dynamic "encryption" {
+    for_each = var.storage_cmek_key_id != "" ? [var.storage_cmek_key_id] : []
+    content {
+      default_kms_key_name = encryption.value
+    }
+  }
+
+  versioning {
+    enabled = true # protección básica ante un borrado/sobrescritura accidental del bundle de la SPA
+  }
+
+  labels = var.labels
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+output "spa_assets_bucket_name" {
+  value       = google_storage_bucket.spa_assets.name
+  description = "Bucket de assets/SPA, cifrado con CMEK propia (bonus) y protegido por las signed URLs de Cloud CDN (bonus)."
 }
 
 resource "google_compute_url_map" "default" {
@@ -397,4 +565,13 @@ output "load_balancer_ip" { value = google_compute_global_address.lb_ip.address 
 # útil para el pipeline de CI/CD (Fase 6) al hacer `docker push`.
 output "artifact_registry_url" {
   value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.oms.repository_id}"
+}
+
+# Agregado por el equipo (Fase 7, bonus Cloud CDN): nombre del secreto
+# que guarda la clave de firma de URLs — quien necesite generar una URL
+# firmada real (`gcloud compute sign-url`) la lee de aquí, nunca del
+# código ni del tfstate en texto plano.
+output "spa_signing_key_secret_id" {
+  value       = google_secret_manager_secret.spa_signing_key.secret_id
+  description = "ID del secreto en Secret Manager con la clave de firma de URLs de Cloud CDN (bonus: signed URLs para SPA)."
 }
