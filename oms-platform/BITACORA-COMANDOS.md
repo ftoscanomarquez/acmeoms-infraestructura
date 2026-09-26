@@ -3154,13 +3154,34 @@ Verificado independientemente contra la API real de GCP (no solo el estado de Te
 
 **Sin costo real relevante mientras tanto** — todo lo que factura de forma significativa (cómputo, base de datos, caché, balanceador) ya está destruido en ambos entornos. Lo pendiente es exclusivamente de red (sin cómputo detrás) y KMS (sin coste por existir, solo por uso activo).
 
-**Siguiente paso al retomar** (mañana o cuando se reanude la sesión):
-```bash
-cd oms-platform/terraform
-terraform init -reconfigure -backend-config=envs/production.backend.hcl
-terraform destroy -var-file=envs/production.tfvars
-# Si falla igual, repetir con staging:
-terraform init -reconfigure -backend-config=envs/staging.backend.hcl
-terraform destroy -var-file=envs/staging.tfvars
+### 9.6 · Resolución real — el peering se eliminó desde la consola web, `destroy` completó en ambos entornos
+
+Tras más de 12 horas de espera sin que la propagación de GCP resolviera el bloqueo por sí sola (confirmado exhaustivamente que ningún recurso real seguía usando la conexión — Cloud SQL, Redis, AlloyDB, Filestore, todo en 0 en ambos proyectos), se resolvió eliminando el peering **manualmente desde la consola web de GCP**, en vez de reintentar vía CLI/Terraform:
+
+1. Consola → **Red de VPC → Conectividad VPC → pestaña "Intercambio de tráfico entre redes de VPC"** (`https://console.cloud.google.com/networking/peering/list?project=<proyecto>`).
+2. Localizar la fila `servicenetworking-googleapis-com` asociada a la VPC del proyecto.
+3. Eliminarla desde ahí (menú de 3 puntos o selección + botón Eliminar).
+
+La consola web sí permitió eliminarla sin el error `Producer services are still using this connection` que tanto `terraform destroy` como `gcloud services vpc-peerings delete` devolvían de forma consistente — indicando que el bloqueo real vivía en una validación específica del lado de esas dos rutas de API (CLI/Terraform), no en un recurso real pendiente ni en la propagación en sí. Verificado con `gcloud services vpc-peerings list` inmediatamente después: lista vacía, confirmando el borrado real.
+
+Con el peering ya eliminado manualmente, **`terraform destroy` se re-ejecutó con éxito en ambos entornos**, sincronizando su estado y destruyendo los 2 recursos restantes que dependían de él (`google_compute_network.main`, `google_compute_global_address.private_service_range`):
+
 ```
-Si el error persiste tras varias horas más de espera, investigar desde la consola web de GCP (IAM & Admin → Service Networking, o Cloud SQL → específicamente el historial de operaciones a nivel de proyecto) — hay reportes de que a veces requiere una intervención manual desde la consola (eliminar el peering desde la UI en vez de la CLI/Terraform) o, en casos extremos, contactar soporte de GCP si supera las 24-48h.
+# Producción:
+Destroy complete! Resources: 2 destroyed.
+
+# Staging:
+Destroy complete! Resources: 2 destroyed.
+```
+
+**Verificación final real, contra la API de GCP, en ambos proyectos** (no solo el resumen de Terraform):
+```bash
+gcloud compute networks list --project=acmeoms-<staging|production>-fatm
+# → solo queda "default" (la red que GCP crea automáticamente en todo proyecto, nunca gestionada por este código)
+gcloud compute addresses list --global --project=acmeoms-<staging|production>-fatm
+# → Listed 0 items.
+gcloud artifacts repositories list --project=acmeoms-<staging|production>-fatm
+# → Listed 0 items.
+```
+
+**Cierre real y completo del proyecto**: toda la infraestructura creada por este trabajo (Terraform: red, base de datos, cómputo, IAM/WIF, KMS; recursos aplicados a mano en ninguna parte, todo declarativo) queda destruida en ambos entornos GCP, sin ningún recurso real facturable pendiente salvo las 4 `CryptoKey` de KMS (2 por entorno), que por limitación real de la API de Google nunca pueden eliminarse del todo — quedan como contenedores vacíos sin coste por existencia, solo por uso activo (ninguna clave en uso desde este punto).

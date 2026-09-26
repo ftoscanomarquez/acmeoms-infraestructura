@@ -6,9 +6,9 @@
 
 ---
 
-## 🏁 AVANCE TOTAL DEL TRABAJO — **~98% completo**
+## 🏁 AVANCE TOTAL DEL TRABAJO — **✅ 100% del ciclo de vida completo**
 
-**Rúbrica base (100 pts): ✅ completa y verificada contra GCP real · Bonus: 3/5 completos (+15 pts), 2/5 sin empezar · Cierre (destroy): 🟡 95% — casi terminado**
+**Rúbrica base (100 pts): ✅ completa y verificada contra GCP real · Bonus: 3/5 completos (+15 pts) · Cierre (destroy): ✅ COMPLETO — ambos entornos destruidos y verificados**
 
 | Fase | Estado | % |
 |---|---|---|
@@ -21,15 +21,15 @@
 | Fase 6 — CI/CD (GitHub Actions + WIF) | ✅ COMPLETA | 100% |
 | Fase 7 — Bonus (3 de 5 opcionales) | 🟡 PARCIAL | 60% (3/5) |
 | Fase 8 — Documentación final | ✅ COMPLETA | 100% |
-| Fase 9 — Cierre (`terraform destroy`) | 🟡 CASI TERMINADO | ~95% |
+| Fase 9 — Cierre (`terraform destroy`) | ✅ COMPLETA | 100% |
 
-> ⚠️ **PUNTO DE RETOMADA INMEDIATO** (si se corta la sesión, empezar aquí): se disparó `terraform destroy` en ambos entornos. **Todo lo que genera costo real (Cloud SQL, Redis, Cloud Run, Load Balancer, KMS, VPC connectors) ya está destruido, verificado contra la API real, en staging Y producción.** Queda pendiente únicamente el último recurso de red (VPC + peering + IP reservada) en ambos, bloqueado por un hallazgo real: los backups automáticos de Cloud SQL sobreviven a la instancia borrada y retienen un proyecto de tenant interno de Google que usa la conexión de peering — se resuelve solo con tiempo (horas). **Sin ningún riesgo de coste relevante mientras tanto.** Ver detalle completo y comandos exactos para reintentar en `BITACORA-COMANDOS.md` § 9.5.
+**El proyecto está cerrado por completo.** Toda la infraestructura real de ambos proyectos GCP (`acmeoms-staging-fatm`, `acmeoms-production-fatm`) fue provisionada, operada, documentada, y finalmente destruida — verificado contra la API real de GCP en cada paso. Lo único que queda existiendo, por una limitación real e irreversible de la API de Cloud KMS (no de este proyecto), son las 4 `CryptoKey` (2 por entorno) del bonus CMEK — sin coste por su sola existencia. Los 2 bonus no abordados (Multi-region DR, Bastion+Datadog) quedan documentados como pendientes por decisión explícita de priorizar los 3 de menor esfuerzo.
 
 ---
 
 ## 📍 Estado actual
 
-**Fase en curso:** ✅ **Fase 9 — cierre real (`terraform destroy`), casi terminado.** El usuario grabó el video de explicación y se disparó el destroy de ambos entornos. Todo lo que genera costo real (Cloud SQL, Redis, Cloud Run, Load Balancer, KMS, VPC connectors) ya está destruido y verificado en staging y producción. Falta solo el último recurso de red (VPC + peering + IP reservada) en ambos, bloqueado por un hallazgo real de GCP (ver `BITACORA-COMANDOS.md` § 9.3-9.5) — se resuelve solo con tiempo, sin ningún riesgo de coste mientras tanto. Sesión pausada por batería; retomar mañana con los comandos exactos documentados en § 9.5.
+**Fase en curso:** ✅ **Proyecto cerrado por completo.** `terraform destroy` se completó con éxito en ambos entornos. El único obstáculo real (la conexión de peering de red privada bloqueada por backups huérfanos de Cloud SQL, más de 12h de espera sin resolución automática) se resolvió eliminando el peering manualmente desde la consola web de GCP — la API vía CLI/Terraform seguía rechazando el borrado, pero la consola sí lo permitió. Tras eso, `terraform destroy` completó sin problemas en ambos entornos (`Destroy complete! Resources: 2 destroyed.` en cada uno). Verificado contra la API real: ambos proyectos solo conservan la red `default` que GCP crea automáticamente (nunca gestionada por este código) — cero recursos propios pendientes salvo las 4 claves KMS irreborrables. Ver el detalle completo de todo el proceso de cierre en `BITACORA-COMANDOS.md` § 9.1-9.6.
 
 **Último hito completado:** El pipeline `ci-cd.yml` corrió de punta a punta (`ci` → `build` con Trivy+Cosign → `deploy-staging` → aprobación manual → `deploy-production`) tras 9 iteraciones de fixes reales, todos documentados en `BITACORA-COMANDOS.md` secciones 6.11–6.19. Verificado con `curl` real al healthcheck y `cosign verify` independiente de la firma en ambos registros (staging y producción).
 
@@ -213,9 +213,21 @@ A petición del usuario ("cuales son las mas faciles de implementar que no impli
 - [x] `DIAGRAMAS.md` — adelantado durante la Fase 3, a petición del usuario: diagrama Mermaid de relación entre los 38 recursos aplicados, tabla resumen por módulo y glosario completo de términos. Documento vivo — se amplía en cada fase futura (Ansible, CI/CD, bonus)
 - [x] `RETROSPECTIVA.md` — desviaciones reales documentadas (NFR-SCAL-001, audit trail no implementado), deuda técnica conocida (criterio de promote-canary.yml), qué se haría distinto
 - [x] Verificación final de los 7 comandos del enunciado (sección 4) — documentados en el README y re-verificados: `terraform plan` en producción tras el cierre de la Fase 7 confirma **"No changes. Your infrastructure matches the configuration."** en ambos entornos
-- [ ] Decidir si se destruye la infraestructura (`terraform destroy` + limpieza) para no agotar crédito, dejando todo documentado para reconstruir — **decisión ya tomada por el usuario: se hará después de grabar el video de explicación del trabajo**
 
 > Los 6 documentos de la Fase 8 (excepto `DIAGRAMAS.md`, ya existente) se escribieron en una sola sesión, basados en lectura directa del código real (todos los `.tf`, `.yml` de Ansible, `Dockerfile`, `ci-cd.yml`) — no son plantillas genéricas, cada afirmación es verificable contra un archivo o un comando real documentado en `BITACORA-COMANDOS.md`.
+
+### Fase 9 — Cierre: `terraform destroy` ✅ COMPLETA
+
+Decisión ya tomada por el usuario desde el inicio del trabajo: destruir toda la infraestructura real tras grabar el video de explicación, para no seguir gastando el crédito de $300/90 días.
+
+- [x] Protecciones de producción bajadas de forma consciente y documentada (`deletion_protection`/`deletion_protection_enabled` en Cloud SQL, `prevent_destroy` en Cloud SQL/KMS/bucket de assets) — mismo patrón ya usado y validado en el bonus CMEK
+- [x] `terraform destroy -var-file=envs/staging.tfvars` — completo. La inmensa mayoría de recursos (IAM/WIF, Load Balancer, Cloud Run, KMS, Secret Manager, VPC connector, Cloud SQL, Redis, firewalls, subredes) se destruyeron sin problema en la primera pasada
+- [x] `terraform destroy -var-file=envs/production.tfvars` — completo, mismo resultado
+- [x] **Hallazgo real resuelto**: la conexión de peering de red privada (`google_service_networking_connection`) quedó bloqueada más de 12h en ambos entornos con `Producer services are still using this connection`, pese a confirmar exhaustivamente (Cloud SQL, Redis, AlloyDB, Filestore, Compute) que nada real seguía usándola — causa probable: backups automáticos huérfanos de Cloud SQL reteniendo un proyecto de tenant interno de Google. Se resolvió eliminando el peering **manualmente desde la consola web de GCP** (Red de VPC → Conectividad VPC → Intercambio de tráfico entre redes de VPC) en ambos proyectos — la consola sí lo permitió donde la API vía CLI/Terraform lo rechazaba consistentemente
+- [x] Verificación final contra la API real de GCP en ambos proyectos: `gcloud compute networks list` solo muestra la red `default` (nunca gestionada por este proyecto), `gcloud compute addresses list`/`gcloud artifacts repositories list` en 0 — **cero recursos propios pendientes**
+- [x] Única excepción real e irreversible: las 4 `CryptoKey` de Cloud KMS (2 por entorno, bonus CMEK) — Google no permite borrar nunca ese tipo de recurso, quedan como contenedores vacíos sin coste por existencia
+
+> Detalle completo, comando por comando, en `BITACORA-COMANDOS.md` § 9.1-9.6.
 
 ---
 
